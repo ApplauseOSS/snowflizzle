@@ -15,6 +15,7 @@
 package cmd
 
 import (
+	"fmt"
 	"os"
 
 	"github.com/applauseoss/snowflizzle/config"
@@ -57,7 +58,8 @@ func init() {
 
 func SyncFile(filePath string, dryRun bool) {
 	logger := logging.GetLogger()
-	logger.Info("Starting sync process", "filePath", filePath, "dryRun", dryRun)
+	logger.Info(fmt.Sprintf("Starting sync process with dryRun:%t", dryRun))
+	logger.Info("Mapping file", "file", filePath)
 	if filePath == "" {
 		logger.Error("No file provided")
 		logger.Error("Sync failed: no file provided")
@@ -69,14 +71,7 @@ func SyncFile(filePath string, dryRun bool) {
 		logger.Error("Validation failed", "error", err)
 		os.Exit(1)
 	}
-
-	if dryRun {
-		err := role.GrantRolesToUsers(nil, rm, dryRun)
-		if err != nil {
-			logger.Error("Failed to simulate granting roles to users in dry run mode", "error", err)
-			os.Exit(1)
-		}
-	}
+	logger.Info("Validation successful!")
 
 	db, err := config.ConnectToSnowflake()
 	if err != nil {
@@ -92,5 +87,11 @@ func SyncFile(filePath string, dryRun bool) {
 	if err := role.GrantRolesToUsers(db, rm, dryRun); err != nil {
 		logger.Error("Failed to grant roles to users", "error", err)
 		os.Exit(1)
+	}
+
+	if dryRun {
+		logger.Info("Dry run completed successfully!")
+	} else {
+		logger.Info("Sync process completed successfully!")
 	}
 }

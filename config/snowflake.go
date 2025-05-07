@@ -34,15 +34,13 @@ func ConnectToSnowflake() (*sql.DB, error) {
 	cwd, _ := os.Getwd()
 	logger.Debug("Working dir:", "dir", cwd)
 	// Load environment variables from .env file if it exists
-	err := godotenv.Load(".env")
-	if err != nil {
-		logger.Warn("Could not load .env file:", "error", err)
-	}
+	_ = godotenv.Load(".env")
 
 	account := os.Getenv("SNOWFLAKE_ACCOUNT")
 	user := os.Getenv("SNOWFLAKE_USER")
 	pkPath := os.Getenv("SNOWFLAKE_PRIVATE_KEY_PATH")
 
+	var err error
 	if account == "" {
 		err = errors.New("SNOWFLAKE_ACCOUNT environment variable not set")
 		logger.Error(err.Error())
@@ -71,7 +69,7 @@ func ConnectToSnowflake() (*sql.DB, error) {
 		User:          user,
 		Authenticator: sf.AuthTypeJwt,
 		PrivateKey:    rsaPrivateKey,
-		Role:          "SYSTEMADMIN",
+		Role:          "SECURITYADMIN",
 	}
 
 	dsn, err := sf.DSN(cfg)
@@ -100,9 +98,9 @@ func ConnectToSnowflake() (*sql.DB, error) {
 		return nil, err
 	}
 
-	if currentRole != "ACCOUNTADMIN" {
-		logger.Error("Role must be ACCOUNTADMIN.")
-		return nil, errors.New("user must be accountadmin")
+	if currentRole != "SECURITYADMIN" {
+		logger.Error("Role must be SECURITYADMIN.")
+		return nil, errors.New("user must be SECURITYADMIN")
 	}
 
 	logger.Debug("Current role:", "role", currentRole)
