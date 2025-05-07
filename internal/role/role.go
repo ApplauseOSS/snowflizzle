@@ -205,51 +205,92 @@ func quoteIdentifier(id string) string {
 // GrantRolesToUsers grants roles to users; accepts *sql.DB
 func GrantRolesToUsers(db *sql.DB, rm *RoleMap, dryRun bool) error {
 	logger := logging.GetLogger()
+
 	if rm == nil || rm.Roles == nil {
 		return errors.New("invalid or empty role map")
 	}
-
-	existingRoles, err := FetchShowRoles(db)
-	if err != nil {
-		return err
-	}
-	existingUsers, err := FetchShowUsers(db)
-	if err != nil {
-		return err
+	if len(rm.Roles) == 0 {
+		return errors.New("role map contains no roles")
 	}
 
-	var considered, skipped, executed int
+	existingRoles := make(map[string]struct{})
+	existingUsers := make(map[string]string)
+
+	if db == nil {
+		if !dryRun {
+			return errors.New("database connection is nil")
+		}
+		logger.Warn("Dry run enabled with nil DB — skipping role/user fetch")
+	} else {
+		var err error
+		existingRoles, err = FetchShowRoles(db)
+		if err != nil {
+			logger.Error("Failed to fetch roles from Snowflake", "error", err)
+			return err
+		}
+
+		existingUsers, err = FetchShowUsers(db)
+		if err != nil {
+			logger.Error("Failed to fetch users from Snowflake", "error", err)
+			return err
+		}
+	}
+
+	var rolesConsidered, rolesSkipped, usersSkipped, executed int
+
 	for role, users := range rm.Roles {
 		upperRole := strings.ToUpper(role)
-		if _, ok := existingRoles[upperRole]; !ok {
-			skipped += len(users)
-			logger.Warn("skipping non-existent role", "role", role)
+
+		if _, exists := existingRoles[upperRole]; len(existingRoles) > 0 && !exists {
+			rolesSkipped += len(users)
+			logger.Warn("Skipping non-existent role", "role", role)
 			continue
 		}
+
 		qRole := quoteIdentifier(role)
+
 		for _, userKey := range users {
-			considered++
-			upperUserKey := strings.ToUpper(userKey)
-			userName, ok := existingUsers[upperUserKey]
-			if !ok {
-				skipped++
-				logger.Warn("skipping non-existent user", "user", userKey)
-				continue
+			rolesConsidered++
+
+			var qUser, displayUser string
+
+			if len(existingUsers) > 0 {
+				upperUserKey := strings.ToUpper(userKey)
+				userName, ok := existingUsers[upperUserKey]
+				if !ok {
+					usersSkipped++
+					logger.Warn("Skipping non-existent user", "user", userKey)
+					continue
+				}
+				qUser = quoteIdentifier(userName)
+				displayUser = userName
+			} else {
+				// If we didn't fetch users when db == nil
+				qUser = quoteIdentifier(userKey)
+				displayUser = userKey
 			}
-			qUser := quoteIdentifier(userName)
+
 			query := fmt.Sprintf("GRANT ROLE %s TO USER %s", qRole, qUser)
+
 			if dryRun {
-				logger.Info("[DryRun]", "query", query)
+				logger.Info("[DryRun] Would execute", "query", query, "role", role, "user", displayUser)
 				continue
 			}
-			logger.Info("executing query", "query", query)
+
+			logger.Info("Executing query", "query", query, "role", role, "user", displayUser)
 			if _, err := db.Exec(query); err != nil {
-				return fmt.Errorf("grant failed for %s->%s: %w", role, userName, err)
+				return fmt.Errorf("grant failed for %s -> %s: %w", role, displayUser, err)
 			}
 			executed++
 		}
 	}
-	logger.Info("grant summary", "considered", considered, "skipped", skipped, "executed", executed)
+
+	logger.Info("Grant summary",
+		"rolesConsidered", rolesConsidered,
+		"usersSkipped", usersSkipped,
+		"grantsExecuted", executed,
+	)
+
 	return nil
 }
 

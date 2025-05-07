@@ -38,6 +38,7 @@ and contains valid data for mapping roles from AD to Snowflake.`,
 			logger.Error("Validation failed", "error", err)
 			os.Exit(1)
 		}
+		logger.Info("Validation successful!")
 	},
 }
 
