@@ -35,48 +35,60 @@ func TestValidateRolesFile(t *testing.T) {
 		{
 			name: "valid_roles_file",
 			content: `roles:
-  ANALYST:
-    - user1@example.com
-    - user2@example.com
-  DEVELOPER:
-    - user3@example.com`,
+  - name: ANALYST
+    members:
+      - email: user1@example.com
+      - email: user2@example.com
+  - name: DEVELOPER
+    members:
+      - email: user3@example.com
+`,
 			expectedError: false,
 		},
 		{
 			name:          "empty_file",
-			content:       `roles: {}`,
+			content:       `roles: []`,
 			expectedError: true,
 			errorContains: "roles must contain at least one role",
 		},
 		{
 			name: "empty_role_name",
 			content: `roles:
-  "":
-    - user1@example.com`,
+  - name: ""
+    members:
+      - email: user1@example.com
+`,
 			expectedError: true,
 			errorContains: "role name cannot be empty",
 		},
 		{
 			name: "role_with_no_users",
 			content: `roles:
-  ANALYST: []`,
+  - name: ANALYST
+    members: []
+`,
 			expectedError: true,
-			errorContains: "must have at least one user",
+			errorContains: "must have at least one member",
 		},
 		{
 			name: "role_with_empty_user",
 			content: `roles:
-  ANALYST:
-    - ""`,
+  - name: ANALYST
+    members:
+      - email: ""
+`,
 			expectedError: true,
-			errorContains: "user in role 'ANALYST' cannot be empty",
+			errorContains: "member in role 'ANALYST' has empty email",
 		},
 		{
 			name: "invalid_yaml",
 			content: `roles:
-  ANALYST:
-  - user1@example.com
-  DEVELOPER: invalid`,
+  - name: ANALYST
+    members:
+      - email: user1@example.com
+  - name: DEVELOPER
+    members: invalid
+`,
 			expectedError: true,
 			errorContains: "failed to parse file as YAML",
 		},
@@ -92,8 +104,19 @@ func TestValidateRolesFile(t *testing.T) {
 				t.Fatalf("Failed to create test file: %v", err)
 			}
 
-			roleMap, err := ValidateRolesFile(tmpFile)
+			rc, err := LoadRolesConfig(tmpFile)
+			if err != nil {
+				if tc.expectedError {
+					if tc.errorContains != "" && !strings.Contains(err.Error(), tc.errorContains) {
+						t.Errorf("Error message doesn't contain expected text. Got: %v, Want: %v", err.Error(), tc.errorContains)
+					}
+				} else {
+					t.Fatalf("Failed to load roles config: %v", err)
+				}
+				return
+			}
 
+			err = ValidateRolesConfig(rc)
 			if tc.expectedError {
 				if err == nil {
 					t.Errorf("Expected error but got nil")
@@ -104,8 +127,8 @@ func TestValidateRolesFile(t *testing.T) {
 				if err != nil {
 					t.Errorf("Expected no error but got: %v", err)
 				}
-				if roleMap == nil {
-					t.Errorf("Expected non-nil roleMap but got nil")
+				if rc == nil {
+					t.Errorf("Expected non-nil rolesConfig but got nil")
 				}
 			}
 		})
@@ -113,7 +136,7 @@ func TestValidateRolesFile(t *testing.T) {
 
 	// Test with non-existent file
 	t.Run("non_existent_file", func(t *testing.T) {
-		_, err := ValidateRolesFile("/path/to/nonexistent/file.yaml")
+		_, err := LoadRolesConfig("/path/to/nonexistent/file.yaml")
 		if err == nil {
 			t.Errorf("Expected error for non-existent file but got nil")
 		}
@@ -174,8 +197,8 @@ func TestFetchShowUsers(t *testing.T) {
 	}
 
 	want := map[string]string{
-		"john@example.com":   "john",
-		"sandra@example.com": "sandra",
+		"JOHN@EXAMPLE.COM":   "john",
+		"SANDRA@EXAMPLE.COM": "sandra",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("got users %v; want %v", got, want)
@@ -193,46 +216,48 @@ func TestFindNonExistentRoles(t *testing.T) {
 
 	tests := []struct {
 		name     string
-		roleMap  *RoleMap
+		rolesCfg *RolesConfig
 		expected []string
 	}{
 		{
 			name: "all roles exist",
-			roleMap: &RoleMap{
-				Roles: map[string][]string{
-					"ADMIN": {"user1"},
+			rolesCfg: &RolesConfig{
+				Roles: []Role{
+					{Name: "ADMIN", Members: []RoleMember{{Email: "user1"}}},
 				},
 			},
 			expected: []string{},
 		},
 		{
 			name: "some roles missing",
-			roleMap: &RoleMap{
-				Roles: map[string][]string{
-					"ADMIN":    {"user1"},
-					"ANALYST":  {"user2"},
-					"REPORTER": {"user3"},
+			rolesCfg: &RolesConfig{
+				Roles: []Role{
+					{Name: "ADMIN", Members: []RoleMember{{Email: "user1"}}},
+					{Name: "ANALYST", Members: []RoleMember{{Email: "user2"}}},
+					{Name: "REPORTER", Members: []RoleMember{{Email: "user3"}}},
 				},
 			},
 			expected: []string{"ANALYST", "REPORTER"},
 		},
 		{
-			name:     "nil rolemap",
-			roleMap:  nil,
+			name:     "nil roles config",
+			rolesCfg: nil,
 			expected: []string{},
 		},
 		{
-			name: "empty roles",
-			roleMap: &RoleMap{
-				Roles: map[string][]string{},
-			},
+			name:     "empty roles",
+			rolesCfg: &RolesConfig{Roles: []Role{}},
 			expected: []string{},
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			result := FindNonExistentRoles(tc.roleMap, existing)
+			rp := &RoleProcessor{
+				rc:            tc.rolesCfg,
+				existingRoles: existing,
+			}
+			result := rp.FindNonExistentRoles()
 
 			// Sort for consistent comparison
 			sortedResult := make([]string, len(result))
@@ -247,5 +272,90 @@ func TestFindNonExistentRoles(t *testing.T) {
 				t.Errorf("Expected non-existent roles %v, but got %v", tc.expected, result)
 			}
 		})
+	}
+}
+
+func TestPatternMatches(t *testing.T) {
+	tests := []struct {
+		pattern   string
+		candidate string
+		want      bool
+	}{
+		{"*", "ANYTHING", true},
+		{"FOO", "FOO", true},
+		{"FOO", "foo", true},
+		{"FOO", "BAR", false},
+		{"FO*", "FOOBAR", true},
+		{"*BAR", "FOOBAR", true},
+		{"*BAR*", "FOOBARBAZ", true},
+		{"*BAR*", "BAZ", false},
+		{"*FOO*", "FOO", true},
+		{"*FOO*", "BARFOOBAZ", true},
+		{"*FOO", "BARFOO", true},
+		{"FOO*", "FOOBAR", true},
+		{"FOO*", "BARFOO", false},
+		{"*FOO", "FOOBAR", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.pattern+"_"+tc.candidate, func(t *testing.T) {
+			got := patternMatches(tc.pattern, tc.candidate)
+			if got != tc.want {
+				t.Errorf("patternMatches(%q, %q) = %v; want %v", tc.pattern, tc.candidate, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestYAMLParsingAndValidation(t *testing.T) {
+	const validYAML = `
+roles:
+  - name: TEST
+    members:
+      - email: user@example.com
+    permissions:
+      databases:
+        - name: MYDB
+          grants: [USAGE]
+      schemas:
+        - name: MYDB.PUBLIC
+          grants: [USAGE]
+      tables:
+        - name: MYDB.PUBLIC.MYTABLE
+          grants: [SELECT]
+`
+	tmpDir := t.TempDir()
+	tmpFile := filepath.Join(tmpDir, "roles.yaml")
+	if err := os.WriteFile(tmpFile, []byte(validYAML), 0644); err != nil {
+		t.Fatalf("Failed to write temp YAML: %v", err)
+	}
+	rc, err := LoadRolesConfig(tmpFile)
+	if err != nil {
+		t.Fatalf("LoadRolesConfig failed: %v", err)
+	}
+	if rc == nil || len(rc.Roles) != 1 {
+		t.Fatalf("Expected 1 role, got %v", rc)
+	}
+	if err := ValidateRolesConfig(rc); err != nil {
+		t.Errorf("ValidateRolesConfig failed: %v", err)
+	}
+
+	// Invalid YAML
+	const invalidYAML = `
+roles:
+  - name: TEST
+    members:
+      - email: user@example.com
+    permissions:
+      databases:
+        - name: MYDB
+          grants: [USAGE
+`
+	tmpFile2 := filepath.Join(tmpDir, "invalid.yaml")
+	if err := os.WriteFile(tmpFile2, []byte(invalidYAML), 0644); err != nil {
+		t.Fatalf("Failed to write temp YAML: %v", err)
+	}
+	_, err = LoadRolesConfig(tmpFile2)
+	if err == nil {
+		t.Error("Expected error for invalid YAML, got nil")
 	}
 }

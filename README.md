@@ -1,25 +1,56 @@
-# snowflizzle
+# Snowflizzle
 
-A mapping tool from User's login_name to Snowflake roles.
+Snowflizzle is a tool for declaratively managing Snowflake roles, users, and their permissions using a YAML configuration file. It enables mapping users (by login name or email) to Snowflake roles, and automates the granting and revoking of database, schema, and table privileges, including support for wildcards and partial name matching. The tool is designed for automation and integrates with Snowflake using a service user and key-pair authentication.
 
-exmaple mapping file:
+## Key Features
+
+- Declarative YAML configuration for roles, members, and permissions
+- Grant and revoke privileges on databases, schemas, and tables
+- Supports wildcard and partial matching for schema and table names
+- Dry-run mode for previewing changes without applying them
+- Validation of configuration files before applying changes
+- Automated warehouse creation and role assignment
+- Designed for integration with CI/CD and automation workflows
 
 ```yaml
+# snowflizzle roles mapping example roles.yaml
+---
 roles:
-  example_role_ro:
-    - <login_name>
-```
-
-roles.yaml
-
-```yaml
-roles:
-  example_role_ro:
-    - user1@example.com
-    - user2@example.com
-  example_role_rw:
-    - user1@example.com
-    - user2@example.com
+  - name: team_role
+    members:
+      - email: exemployee1@example.com
+      - email: exemployee2@example.com
+        removed: true
+    permissions:
+    # Option for names
+      # - database_name
+      databases:
+        - name: test_a_db
+          grants:
+            - USAGE
+        - name: test_b_db
+          remove: true
+      schemas:
+      # Options for names
+      # - database_name.schema_name
+      # - database_name.*
+      # - database_name.*schema_partial
+      # - database_name.schema_partial*
+        - name: test_c_db.credentials
+          grants:
+            - USAGE
+        - name: test_b_db.assets
+      tables:
+      # Options for names
+      # - database_name.*.*
+      # - database_name.schema_name.*
+      # - database_name.schema_partial_*.*
+      # - database_name.*_schema_partial.*
+      # - database_name.schema_name.table_name
+        - name: test_c_db.credentials
+          grants:
+            - SELECT
+        - name: test_b_db.*.*
 ```
 
 Prepare snowflizzle service user in snowflake

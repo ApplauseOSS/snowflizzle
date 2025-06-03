@@ -66,7 +66,13 @@ func SyncFile(filePath string, dryRun bool) {
 		os.Exit(1)
 	}
 
-	rm, err := role.ValidateRolesFile(filePath)
+	rc, err := role.LoadRolesConfig(filePath)
+	if err != nil {
+		logger.Error("Failed to load roles config", "error", err)
+		os.Exit(1)
+	}
+
+	err = role.ValidateRolesConfig(rc)
 	if err != nil {
 		logger.Error("Validation failed", "error", err)
 		os.Exit(1)
@@ -84,7 +90,12 @@ func SyncFile(filePath string, dryRun bool) {
 		}
 	}()
 
-	if err := role.GrantRolesToUsers(db, rm, dryRun); err != nil {
+	rp, err := role.NewRoleProcessor(db, rc, dryRun)
+	if err != nil {
+		logger.Error("Failed to initialize role processor", "error", err)
+		os.Exit(1)
+	}
+	if err := rp.Process(); err != nil {
 		logger.Error("Failed to grant roles to users", "error", err)
 		os.Exit(1)
 	}
