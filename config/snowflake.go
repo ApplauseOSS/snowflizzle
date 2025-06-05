@@ -63,13 +63,12 @@ func ConnectToSnowflake() (*sql.DB, error) {
 		return nil, err
 	}
 
-	// Create a Snowflake configuration
+	// Do NOT specify a Role, so the user's default role is used
 	cfg := &sf.Config{
 		Account:       account,
 		User:          user,
 		Authenticator: sf.AuthTypeJwt,
 		PrivateKey:    rsaPrivateKey,
-		Role:          "SECURITYADMIN",
 	}
 
 	dsn, err := sf.DSN(cfg)
@@ -98,9 +97,9 @@ func ConnectToSnowflake() (*sql.DB, error) {
 		return nil, err
 	}
 
-	if currentRole != "SECURITYADMIN" {
-		logger.Error("Role must be SECURITYADMIN.")
-		return nil, errors.New("user must be SECURITYADMIN")
+	// Warn if role is not SYSADMIN or ACCOUNTADMIN
+	if currentRole != "SYSADMIN" && currentRole != "ACCOUNTADMIN" {
+		logger.Warn("Role needs to have privileges to manage users, warehouses, databases. Current role: " + currentRole)
 	}
 
 	logger.Debug("Current role:", "role", currentRole)
