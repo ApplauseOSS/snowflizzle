@@ -343,37 +343,37 @@ func (rp *RoleProcessor) createRoleIfNotExists() error {
 }
 
 // createWarehouseIfNotExists creates a warehouse with the same name as the role, uppercased and postfixed with _WH, if it does not exist.
-func (rp *RoleProcessor) createWarehouseIfNotExists() error {
+func (rp *RoleProcessor) createWarehouseIfNotExists() (string, error) {
 	warehouseName := rp.roleName + "_WAREHOUSE"
 	qWarehouse := quoteIdentifier(warehouseName)
 
 	// Use cached warehouses instead of fetching every time
 	if _, exists := rp.existingWarehouses[warehouseName]; exists {
 		rp.logger.Info("Warehouse already exists", "warehouse", warehouseName)
-		return nil
+		return warehouseName, nil
 	}
 
 	createWarehouseQuery := fmt.Sprintf(
 		`CREATE WAREHOUSE IF NOT EXISTS %s
-      WITH
-        WAREHOUSE_SIZE = XSMALL
-        WAREHOUSE_TYPE = STANDARD
-        AUTO_SUSPEND = 60
-        AUTO_RESUME = TRUE
-        INITIALLY_SUSPENDED = TRUE`,
+    WITH
+    WAREHOUSE_SIZE = XSMALL
+    WAREHOUSE_TYPE = STANDARD
+    AUTO_SUSPEND = 60
+    AUTO_RESUME = TRUE
+    INITIALLY_SUSPENDED = TRUE`,
 		qWarehouse,
 	)
 	if rp.dryRun {
 		rp.logger.Info("[DryRun] Would create warehouse", "query", createWarehouseQuery, "warehouse", warehouseName)
-		return nil
+		return warehouseName, nil
 	}
 	rp.logger.Info("Creating warehouse", "query", createWarehouseQuery, "warehouse", warehouseName)
 	if _, err := rp.db.Exec(createWarehouseQuery); err != nil {
-		return fmt.Errorf("failed to create warehouse %s: %w", warehouseName, err)
+		return warehouseName, fmt.Errorf("failed to create warehouse %s: %w", warehouseName, err)
 	}
 	// Add to cache so subsequent calls know it exists
 	rp.existingWarehouses[warehouseName] = warehouseName
-	return nil
+	return warehouseName, nil
 }
 
 func (rp *RoleProcessor) grantRoleToUser() error {
@@ -389,8 +389,7 @@ func (rp *RoleProcessor) grantRoleToUser() error {
 	return nil
 }
 
-func (rp *RoleProcessor) grantWarehouseToRole() error {
-	warehouseName := rp.roleName + "_WH"
+func (rp *RoleProcessor) grantWarehouseToRole(warehouseName string) error {
 	qWarehouse := quoteIdentifier(warehouseName)
 	grantQuery := fmt.Sprintf("GRANT USAGE ON WAREHOUSE %s TO ROLE %s", qWarehouse, rp.qRole)
 	if rp.dryRun {
@@ -653,10 +652,11 @@ func (rp *RoleProcessor) Process() error {
 
 		// process warehouse creation and grants, except for system-defined roles
 		if _, isSystem := systemRoles[rp.roleName]; !isSystem {
-			if err := rp.createWarehouseIfNotExists(); err != nil {
+			warehouseName, err := rp.createWarehouseIfNotExists()
+			if err != nil {
 				return err
 			}
-			if err := rp.grantWarehouseToRole(); err != nil {
+			if err := rp.grantWarehouseToRole(warehouseName); err != nil {
 				return err
 			}
 		}
