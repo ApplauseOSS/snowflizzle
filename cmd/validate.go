@@ -30,10 +30,17 @@ var validateCmd = &cobra.Command{
 	Long: `Validate the roles.yaml file to ensure it conforms to the expected format
 and contains valid data for mapping roles from AD to Snowflake.`,
 	Run: func(cmd *cobra.Command, args []string) {
-		filepath := args[0]
+		filePath := args[0]
 		logger := logging.GetLogger()
-		logger.Info("Validating", "filepath", filepath)
-		_, err := role.ValidateRolesFile(filepath)
+		logger.Info("Validating", "filePath", filePath)
+
+		rc, err := role.LoadRolesConfig(filePath)
+		if err != nil {
+			logger.Error("Failed to load roles config", "error", err)
+			os.Exit(1)
+		}
+
+		err = role.ValidateRolesConfig(rc)
 		if err != nil {
 			logger.Error("Validation failed", "error", err)
 			os.Exit(1)
