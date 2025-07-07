@@ -15,6 +15,7 @@
 package config
 
 import (
+	"context"
 	"crypto/rsa"
 	"crypto/x509"
 	"database/sql"
@@ -83,14 +84,15 @@ func ConnectToSnowflake() (*sql.DB, error) {
 		return nil, err
 	}
 
-	if err := db.Ping(); err != nil {
+	ctx := context.Background()
+	if err := db.PingContext(ctx); err != nil {
 		logger.Error("Ping to Snowflake failed:", "error", err)
 		return nil, err
 	}
 
 	logger.Info("Connected to Snowflake!")
 
-	row := db.QueryRow("SELECT CURRENT_ROLE()")
+	row := db.QueryRowContext(ctx, "SELECT CURRENT_ROLE()")
 	var currentRole string
 	if err := row.Scan(&currentRole); err != nil {
 		logger.Error("Failed to get current role:", "error", err)

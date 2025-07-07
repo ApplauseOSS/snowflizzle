@@ -17,6 +17,7 @@
 package role
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -124,7 +125,8 @@ func LoadRolesConfig(filePath string) (*RolesConfig, error) {
 // FetchShowRoles returns a set of role names from SHOW ROLES.
 func FetchShowRoles(db *sql.DB) (map[string]struct{}, error) {
 	logger := logging.GetLogger()
-	rows, err := db.Query("SHOW ROLES")
+	ctx := context.Background()
+	rows, err := db.QueryContext(ctx, "SHOW ROLES")
 	if err != nil {
 		logger.Error("query SHOW ROLES failed", "error", err)
 		return nil, fmt.Errorf("error querying SHOW ROLES: %w", err)
@@ -173,7 +175,8 @@ func FetchShowRoles(db *sql.DB) (map[string]struct{}, error) {
 // FetchShowUsers returns a map from login_name to NAME from SHOW USERS.
 func FetchShowUsers(db *sql.DB) (map[string]string, error) {
 	logger := logging.GetLogger()
-	rows, err := db.Query("SHOW USERS")
+	ctx := context.Background()
+	rows, err := db.QueryContext(ctx, "SHOW USERS")
 	if err != nil {
 		logger.Error("query SHOW USERS failed", "error", err)
 		return nil, fmt.Errorf("error querying SHOW USERS: %w", err)
@@ -226,7 +229,8 @@ func FetchShowUsers(db *sql.DB) (map[string]string, error) {
 // FetchShowWarehouses returns a map from warehouse name to warehouse name from SHOW WAREHOUSES.
 func FetchShowWarehouses(db *sql.DB) (map[string]string, error) {
 	logger := logging.GetLogger()
-	rows, err := db.Query("SHOW WAREHOUSES")
+	ctx := context.Background()
+	rows, err := db.QueryContext(ctx, "SHOW WAREHOUSES")
 	if err != nil {
 		logger.Error("query SHOW WAREHOUSES failed", "error", err)
 		return nil, fmt.Errorf("error querying SHOW WAREHOUSES: %w", err)
@@ -339,13 +343,14 @@ func quoteIdentifier(id string) string {
 }
 
 func (rp *RoleProcessor) createRoleIfNotExists() error {
+	ctx := context.Background()
 	createRoleQuery := "CREATE ROLE IF NOT EXISTS " + rp.qRole
 	if rp.dryRun {
 		rp.logger.Info("[DryRun] Would create role", "query", createRoleQuery, "role", rp.roleName)
 		return nil
 	}
 	rp.logger.Info("Creating role", "query", createRoleQuery, "role", rp.roleName)
-	if _, err := rp.db.Exec(createRoleQuery); err != nil {
+	if _, err := rp.db.ExecContext(ctx, createRoleQuery); err != nil {
 		return fmt.Errorf("failed to create role %s: %w", rp.roleName, err)
 	}
 	return nil
@@ -353,6 +358,7 @@ func (rp *RoleProcessor) createRoleIfNotExists() error {
 
 // createWarehouseIfNotExists creates a warehouse with the same name as the role, uppercased and postfixed with _WH, if it does not exist.
 func (rp *RoleProcessor) createWarehouseIfNotExists() (string, error) {
+	ctx := context.Background()
 	warehouseName := rp.roleName + "_WAREHOUSE"
 	qWarehouse := quoteIdentifier(warehouseName)
 
@@ -377,7 +383,7 @@ func (rp *RoleProcessor) createWarehouseIfNotExists() (string, error) {
 		return warehouseName, nil
 	}
 	rp.logger.Info("Creating warehouse", "query", createWarehouseQuery, "warehouse", warehouseName)
-	if _, err := rp.db.Exec(createWarehouseQuery); err != nil {
+	if _, err := rp.db.ExecContext(ctx, createWarehouseQuery); err != nil {
 		return warehouseName, fmt.Errorf("failed to create warehouse %s: %w", warehouseName, err)
 	}
 	// Add to cache so subsequent calls know it exists
@@ -386,19 +392,21 @@ func (rp *RoleProcessor) createWarehouseIfNotExists() (string, error) {
 }
 
 func (rp *RoleProcessor) grantRoleToUser() error {
+	ctx := context.Background()
 	query := fmt.Sprintf("GRANT ROLE %s TO USER %s", rp.qRole, rp.qUser)
 	if rp.dryRun {
 		rp.logger.Info("[DryRun] Would execute", "query", query, "role", rp.roleName, "user", rp.displayUser)
 		return nil
 	}
 	rp.logger.Info("Executing query", "query", query, "role", rp.roleName, "user", rp.displayUser)
-	if _, err := rp.db.Exec(query); err != nil {
+	if _, err := rp.db.ExecContext(ctx, query); err != nil {
 		return fmt.Errorf("grant failed for %s -> %s: %w", rp.roleName, rp.displayUser, err)
 	}
 	return nil
 }
 
 func (rp *RoleProcessor) grantWarehouseToRole(warehouseName string) error {
+	ctx := context.Background()
 	qWarehouse := quoteIdentifier(warehouseName)
 	grantQuery := fmt.Sprintf("GRANT USAGE ON WAREHOUSE %s TO ROLE %s", qWarehouse, rp.qRole)
 	if rp.dryRun {
@@ -406,13 +414,14 @@ func (rp *RoleProcessor) grantWarehouseToRole(warehouseName string) error {
 		return nil
 	}
 	rp.logger.Info("Granting warehouse usage", "query", grantQuery, "warehouse", warehouseName, "role", rp.roleName)
-	if _, err := rp.db.Exec(grantQuery); err != nil {
+	if _, err := rp.db.ExecContext(ctx, grantQuery); err != nil {
 		return fmt.Errorf("failed to grant USAGE on warehouse %s to role %s: %w", warehouseName, rp.roleName, err)
 	}
 	return nil
 }
 
 func (rp *RoleProcessor) revokeRoleFromUser() error {
+	ctx := context.Background()
 	//nolint:gosec // G202: Identifiers are quoted using quoteIdentifier
 	query := "REVOKE ROLE " + rp.qRole + " FROM USER " + rp.qUser
 	if rp.dryRun {
@@ -420,7 +429,7 @@ func (rp *RoleProcessor) revokeRoleFromUser() error {
 		return nil
 	}
 	rp.logger.Info("Executing revoke", "query", query, "role", rp.roleName, "user", rp.displayUser)
-	if _, err := rp.db.Exec(query); err != nil {
+	if _, err := rp.db.ExecContext(ctx, query); err != nil {
 		return fmt.Errorf("failed to revoke role %s from user %s: %w", rp.roleName, rp.displayUser, err)
 	}
 	return nil
@@ -460,6 +469,7 @@ func (rp *RoleProcessor) memberProcess(role Role) (usersSkipped int, err error) 
 }
 
 func (rp *RoleProcessor) execPrivilegeQuery(query, action, objectType, objectName, privilege string, dryRun bool) error {
+	ctx := context.Background()
 	if dryRun {
 		rp.logger.Info(fmt.Sprintf("[DryRun] Would %s %s privilege", action, objectType),
 			"query", query, "object", objectName, "privilege", privilege, "role", rp.roleName)
@@ -467,7 +477,7 @@ func (rp *RoleProcessor) execPrivilegeQuery(query, action, objectType, objectNam
 	}
 	rp.logger.Info(fmt.Sprintf("%s %s privilege", action, objectType),
 		"query", query, "object", objectName, "privilege", privilege, "role", rp.roleName)
-	_, err := rp.db.Exec(query)
+	_, err := rp.db.ExecContext(ctx, query)
 	return err
 }
 
@@ -748,6 +758,7 @@ func (rp *RoleProcessor) permissionProcess(role Role) error {
 
 // Process executes the role processing logic.
 func (rp *RoleProcessor) Process() error {
+	ctx := context.Background()
 	if rp.rc == nil || len(rp.rc.Roles) == 0 {
 		return errors.New("invalid or empty roles config")
 	}
@@ -769,7 +780,7 @@ func (rp *RoleProcessor) Process() error {
 					rp.logger.Info("[DryRun] Would drop role", "query", dropRoleQuery, "role", rp.roleName)
 				} else {
 					rp.logger.Info("Dropping role", "query", dropRoleQuery, "role", rp.roleName)
-					if _, err := rp.db.Exec(dropRoleQuery); err != nil {
+					if _, err := rp.db.ExecContext(ctx, dropRoleQuery); err != nil {
 						return fmt.Errorf("failed to drop role %s: %w", rp.roleName, err)
 					}
 				}
@@ -835,8 +846,9 @@ func (rp *RoleProcessor) FindNonExistentRoles() []string {
 
 // GetSchemasInDatabase fetches all schemas in a given database.
 func (rp *RoleProcessor) GetSchemasInDatabase(dbName string) ([]string, error) {
+	ctx := context.Background()
 	query := "SHOW SCHEMAS IN DATABASE " + quoteIdentifier(dbName)
-	rows, err := rp.db.Query(query)
+	rows, err := rp.db.QueryContext(ctx, query)
 	if err != nil {
 		rp.logger.Error("SHOW SCHEMAS failed", "database", dbName, "error", err)
 		return nil, fmt.Errorf("SHOW SCHEMAS failed for database %s: %w", dbName, err)
@@ -892,8 +904,9 @@ func patternMatches(pattern, candidate string) bool {
 
 // GetTablesInDatabase fetches all tables in a given database, grouped by schema.
 func (rp *RoleProcessor) GetTablesInDatabase(dbName string) (map[string][]string, error) {
+	ctx := context.Background()
 	query := "SHOW TABLES IN DATABASE " + quoteIdentifier(dbName)
-	rows, err := rp.db.Query(query)
+	rows, err := rp.db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, err
 	}
@@ -932,8 +945,9 @@ func (rp *RoleProcessor) GetTablesInDatabase(dbName string) (map[string][]string
 
 // GetViewsInDatabase fetches all views in a given database, grouped by schema.
 func (rp *RoleProcessor) GetViewsInDatabase(dbName string) (map[string][]string, error) {
+	ctx := context.Background()
 	query := "SHOW VIEWS IN DATABASE " + quoteIdentifier(dbName)
-	rows, err := rp.db.Query(query)
+	rows, err := rp.db.QueryContext(ctx, query)
 	if err != nil {
 		errStr := strings.ToLower(err.Error())
 		if strings.Contains(errStr, "does not exist") || strings.Contains(errStr, "not found") {
@@ -1023,9 +1037,10 @@ type FetchedRoleGrant struct {
 // Returns a slice of FetchedRoleGrant for each grant.
 func (rp *RoleProcessor) FetchRoleGrants(roleName string) ([]FetchedRoleGrant, error) {
 	logger := rp.logger
+	ctx := context.Background()
 	qRole := quoteIdentifier(strings.ToUpper(roleName))
 	query := "SHOW GRANTS TO ROLE " + qRole
-	rows, err := rp.db.Query(query)
+	rows, err := rp.db.QueryContext(ctx, query)
 	if err != nil {
 		logger.Error("query SHOW GRANTS TO ROLE failed", "error", err, "role", roleName)
 		return nil, fmt.Errorf("error querying SHOW GRANTS TO ROLE %s: %w", roleName, err)
