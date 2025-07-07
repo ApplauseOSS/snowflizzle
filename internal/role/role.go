@@ -602,6 +602,30 @@ func (rp *RoleProcessor) permissionProcess(role Role) error {
 				}
 			}
 		}
+		// Grant future privileges if tablePattern == "*"
+		if tablePattern == "*" {
+			qDB := quoteIdentifier(dbName)
+			schemas, err := rp.GetSchemasInDatabase(dbName)
+			if err != nil {
+				rp.logger.Error("Could not fetch schemas for future grants", "database", dbName, "error", err)
+			} else {
+				for _, schema := range schemas {
+					if !patternMatches(schemaPattern, schema) {
+						continue
+					}
+					qSchema := quoteIdentifier(schema)
+					objectName := fmt.Sprintf("%s.%s", dbName, schema)
+					for _, grant := range tbl.Grants {
+						grant = strings.ToUpper(grant)
+						query := fmt.Sprintf("GRANT %s ON FUTURE TABLES IN SCHEMA %s.%s TO ROLE %s", grant, qDB, qSchema, rp.qRole)
+						err := rp.execPrivilegeQuery(query, "grant", "future_table", objectName, grant, rp.dryRun)
+						if err != nil {
+							rp.logger.Warn("Failed to grant future privilege on tables", "schema", objectName, "privilege", grant, "error", err)
+						}
+					}
+				}
+			}
+		}
 		tablesBySchema, err := rp.GetTablesInDatabase(dbName)
 		if err != nil {
 			rp.logger.Error("Could not fetch tables", "database", dbName, "error", err)
@@ -690,6 +714,30 @@ func (rp *RoleProcessor) permissionProcess(role Role) error {
 							continue
 						}
 						return fmt.Errorf("failed to grant USAGE on schema %s to role %s: %w", objectName, rp.roleName, err)
+					}
+				}
+			}
+		}
+		// Grant future privileges if viewPattern == "*"
+		if viewPattern == "*" {
+			qDB := quoteIdentifier(dbName)
+			schemas, err := rp.GetSchemasInDatabase(dbName)
+			if err != nil {
+				rp.logger.Error("Could not fetch schemas for future grants (views)", "database", dbName, "error", err)
+			} else {
+				for _, schema := range schemas {
+					if !patternMatches(schemaPattern, schema) {
+						continue
+					}
+					qSchema := quoteIdentifier(schema)
+					objectName := fmt.Sprintf("%s.%s", dbName, schema)
+					for _, grant := range vw.Grants {
+						grant = strings.ToUpper(grant)
+						query := fmt.Sprintf("GRANT %s ON FUTURE VIEWS IN SCHEMA %s.%s TO ROLE %s", grant, qDB, qSchema, rp.qRole)
+						err := rp.execPrivilegeQuery(query, "grant", "future_view", objectName, grant, rp.dryRun)
+						if err != nil {
+							rp.logger.Warn("Failed to grant future privilege on views", "schema", objectName, "privilege", grant, "error", err)
+						}
 					}
 				}
 			}
