@@ -288,6 +288,8 @@ type RoleProcessor struct {
 	qUser       string
 	roleName    string
 	displayUser string
+
+	currentGrants map[GrantKey]struct{} // holds current grants for the role
 }
 
 // NewRoleProcessor constructs a RoleProcessor and initializes its state.
@@ -343,14 +345,8 @@ func quoteIdentifier(id string) string {
 }
 
 func (rp *RoleProcessor) createRoleIfNotExists() error {
-	ctx := context.Background()
 	createRoleQuery := "CREATE ROLE IF NOT EXISTS " + rp.qRole
-	if rp.dryRun {
-		rp.logger.Info("[DryRun] Would create role", "query", createRoleQuery, "role", rp.roleName)
-		return nil
-	}
-	rp.logger.Info("Creating role", "query", createRoleQuery, "role", rp.roleName)
-	if _, err := rp.db.ExecContext(ctx, createRoleQuery); err != nil {
+	if err := rp.execQuery(createRoleQuery); err != nil {
 		return fmt.Errorf("failed to create role %s: %w", rp.roleName, err)
 	}
 	return nil
@@ -358,7 +354,6 @@ func (rp *RoleProcessor) createRoleIfNotExists() error {
 
 // createWarehouseIfNotExists creates a warehouse with the same name as the role, uppercased and postfixed with _WH, if it does not exist.
 func (rp *RoleProcessor) createWarehouseIfNotExists() (string, error) {
-	ctx := context.Background()
 	warehouseName := rp.roleName + "_WAREHOUSE"
 	qWarehouse := quoteIdentifier(warehouseName)
 
@@ -378,12 +373,7 @@ func (rp *RoleProcessor) createWarehouseIfNotExists() (string, error) {
     INITIALLY_SUSPENDED = TRUE`,
 		qWarehouse,
 	)
-	if rp.dryRun {
-		rp.logger.Info("[DryRun] Would create warehouse", "query", createWarehouseQuery, "warehouse", warehouseName)
-		return warehouseName, nil
-	}
-	rp.logger.Info("Creating warehouse", "query", createWarehouseQuery, "warehouse", warehouseName)
-	if _, err := rp.db.ExecContext(ctx, createWarehouseQuery); err != nil {
+	if err := rp.execQuery(createWarehouseQuery); err != nil {
 		return warehouseName, fmt.Errorf("failed to create warehouse %s: %w", warehouseName, err)
 	}
 	// Add to cache so subsequent calls know it exists
@@ -392,47 +382,60 @@ func (rp *RoleProcessor) createWarehouseIfNotExists() (string, error) {
 }
 
 func (rp *RoleProcessor) grantRoleToUser() error {
-	ctx := context.Background()
 	query := fmt.Sprintf("GRANT ROLE %s TO USER %s", rp.qRole, rp.qUser)
-	if rp.dryRun {
-		rp.logger.Info("[DryRun] Would execute", "query", query, "role", rp.roleName, "user", rp.displayUser)
-		return nil
-	}
-	rp.logger.Info("Executing query", "query", query, "role", rp.roleName, "user", rp.displayUser)
-	if _, err := rp.db.ExecContext(ctx, query); err != nil {
+	if err := rp.execQuery(query); err != nil {
 		return fmt.Errorf("grant failed for %s -> %s: %w", rp.roleName, rp.displayUser, err)
 	}
 	return nil
 }
 
 func (rp *RoleProcessor) grantWarehouseToRole(warehouseName string) error {
-	ctx := context.Background()
 	qWarehouse := quoteIdentifier(warehouseName)
-	grantQuery := fmt.Sprintf("GRANT USAGE ON WAREHOUSE %s TO ROLE %s", qWarehouse, rp.qRole)
-	if rp.dryRun {
-		rp.logger.Info("[DryRun] Would grant warehouse usage", "query", grantQuery, "warehouse", warehouseName, "role", rp.roleName)
+	grantKey := GrantKey{
+		Privilege:  "USAGE",
+		ObjectType: "WAREHOUSE",
+		ObjectName: strings.ToUpper(warehouseName),
+	}
+	// Check if the grant already exists
+	if _, exists := rp.currentGrants[grantKey]; exists {
+		rp.logger.Info("Warehouse usage already granted to role", "warehouse", warehouseName, "role", rp.roleName)
 		return nil
 	}
-	rp.logger.Info("Granting warehouse usage", "query", grantQuery, "warehouse", warehouseName, "role", rp.roleName)
-	if _, err := rp.db.ExecContext(ctx, grantQuery); err != nil {
+
+	grantQuery := fmt.Sprintf("GRANT USAGE ON WAREHOUSE %s TO ROLE %s", qWarehouse, rp.qRole)
+	if err := rp.execQuery(grantQuery); err != nil {
 		return fmt.Errorf("failed to grant USAGE on warehouse %s to role %s: %w", warehouseName, rp.roleName, err)
 	}
+	// update currentGrants to reflect the new grant because we are not fetching current grants again
+	rp.currentGrants[grantKey] = struct{}{}
 	return nil
 }
 
 func (rp *RoleProcessor) revokeRoleFromUser() error {
-	ctx := context.Background()
 	//nolint:gosec // G202: Identifiers are quoted using quoteIdentifier
 	query := "REVOKE ROLE " + rp.qRole + " FROM USER " + rp.qUser
-	if rp.dryRun {
-		rp.logger.Info("[DryRun] Would execute", "query", query, "role", rp.roleName, "user", rp.displayUser)
-		return nil
-	}
-	rp.logger.Info("Executing revoke", "query", query, "role", rp.roleName, "user", rp.displayUser)
-	if _, err := rp.db.ExecContext(ctx, query); err != nil {
+	if err := rp.execQuery(query); err != nil {
 		return fmt.Errorf("failed to revoke role %s from user %s: %w", rp.roleName, rp.displayUser, err)
 	}
 	return nil
+}
+
+// GrantKey uniquely identifies a privilege grant on an object
+// Example: Privilege: "SELECT", ObjectType: "TABLE", ObjectName: "MYDB.PUBLIC.MYTABLE"
+type GrantKey struct {
+	Privilege  string
+	ObjectType string // DATABASE, SCHEMA, TABLE, VIEW
+	ObjectName string // e.g. MYDB, MYDB.PUBLIC, MYDB.PUBLIC.MYTABLE
+}
+
+// normalizeObjectName strips quotes and uppercases all parts for consistent diffing
+func normalizeObjectName(objectName string) string {
+	parts := strings.Split(objectName, ".")
+	for i, part := range parts {
+		part = strings.Trim(part, "\"")
+		parts[i] = strings.ToUpper(part)
+	}
+	return strings.Join(parts, ".")
 }
 
 // memberProcess processes each member of the given Role, granting or revoking the role as needed.
@@ -468,109 +471,48 @@ func (rp *RoleProcessor) memberProcess(role Role) (usersSkipped int, err error) 
 	return
 }
 
-func (rp *RoleProcessor) execPrivilegeQuery(query, action, objectType, objectName, privilege string, dryRun bool) error {
+func (rp *RoleProcessor) execQuery(query string) error {
 	ctx := context.Background()
-	if dryRun {
-		rp.logger.Info(fmt.Sprintf("[DryRun] Would %s %s privilege", action, objectType),
-			"query", query, "object", objectName, "privilege", privilege, "role", rp.roleName)
+	if rp.dryRun {
+		rp.logger.Info("[DryRun]", "query", query)
 		return nil
 	}
-	rp.logger.Info(fmt.Sprintf("%s %s privilege", action, objectType),
-		"query", query, "object", objectName, "privilege", privilege, "role", rp.roleName)
+	rp.logger.Info("[Executing]", "query", query)
 	_, err := rp.db.ExecContext(ctx, query)
 	return err
 }
 
-func (rp *RoleProcessor) permissionProcess(role Role) error {
+// Rename permissionProcess to applySpecialGrants for clarity
+func (rp *RoleProcessor) applySpecialGrants(role Role) error {
 	if role.Permissions == nil {
 		return nil
 	}
-	// Process database permissions
-	for _, dbPerm := range role.Permissions.Databases {
-		dbName := dbPerm.Name
-		qDB := quoteIdentifier(strings.ToUpper(dbName))
-		if dbPerm.Remove {
-			if len(dbPerm.Grants) == 0 {
-				revokeQuery := fmt.Sprintf("REVOKE ALL PRIVILEGES ON DATABASE %s FROM ROLE %s", qDB, rp.qRole)
-				if err := rp.execPrivilegeQuery(revokeQuery, "revoke", "database", dbName, "ALL PRIVILEGES", rp.dryRun); err != nil {
-					return fmt.Errorf("failed to revoke privileges on database %s from role %s: %w", dbName, rp.roleName, err)
-				}
-			} else {
-				for _, grant := range dbPerm.Grants {
-					revokeQuery := fmt.Sprintf("REVOKE %s ON DATABASE %s FROM ROLE %s", strings.ToUpper(grant), qDB, rp.qRole)
-					if err := rp.execPrivilegeQuery(revokeQuery, "revoke", "database", dbName, grant, rp.dryRun); err != nil {
-						return fmt.Errorf("failed to revoke %s on database %s from role %s: %w", grant, dbName, rp.roleName, err)
-					}
-				}
-			}
-		} else {
-			if len(dbPerm.Grants) == 0 {
-				continue
-			}
-			for _, grant := range dbPerm.Grants {
-				grantQuery := fmt.Sprintf("GRANT %s ON DATABASE %s TO ROLE %s", strings.ToUpper(grant), qDB, rp.qRole)
-				if err := rp.execPrivilegeQuery(grantQuery, "grant", "database", dbName, grant, rp.dryRun); err != nil {
-					return fmt.Errorf("failed to grant %s on database %s to role %s: %w", grant, dbName, rp.roleName, err)
-				}
-			}
-		}
-	}
-	// Process schema permissions
-	for _, sch := range role.Permissions.Schemas {
-		nameParts := strings.SplitN(sch.Name, ".", 2)
-		if len(nameParts) < 2 {
-			rp.logger.Warn("Schema permission name must be in format DATABASE.SCHEMA or wildcard", "name", sch.Name)
-			continue
-		}
-		dbName := strings.ToUpper(nameParts[0])
-		schemaPattern := nameParts[1]
 
-		// Fetch all schemas in the database
+	// Helper to grant USAGE on all schemas in a database
+	grantUsageOnAllSchemas := func(dbName string) error {
 		schemas, err := rp.GetSchemasInDatabase(dbName)
 		if err != nil {
-			rp.logger.Error("Could not fetch schemas", "database", dbName, "error", err)
-			continue
+			rp.logger.Error("Could not fetch schemas for USAGE grant", "database", dbName, "error", err)
+			return fmt.Errorf("failed to fetch schemas for USAGE grant on database %s: %w", dbName, err)
 		}
-
-		// Grant/revoke on all matching schemas
-		matched := 0
-		for _, actualSchema := range schemas {
-			if !patternMatches(schemaPattern, actualSchema) {
-				continue
-			}
-			matched++
-			qDB := quoteIdentifier(dbName)
-			qSchema := quoteIdentifier(actualSchema)
-			objectName := fmt.Sprintf("%s.%s", dbName, actualSchema)
-			if sch.Remove && len(sch.Grants) == 0 {
-				query := fmt.Sprintf("REVOKE ALL PRIVILEGES ON SCHEMA %s.%s FROM ROLE %s", qDB, qSchema, rp.qRole)
-				action := "revoke"
-				if err := rp.execPrivilegeQuery(query, action, "schema", objectName, "ALL PRIVILEGES", rp.dryRun); err != nil {
-					return fmt.Errorf("failed to revoke all privileges on schema %s from role %s: %w", objectName, rp.roleName, err)
+		qDB := quoteIdentifier(dbName)
+		for _, schemaName := range schemas {
+			qSchema := quoteIdentifier(schemaName)
+			objectName := fmt.Sprintf("%s.%s", dbName, schemaName)
+			query := fmt.Sprintf("GRANT USAGE ON SCHEMA %s.%s TO ROLE %s", qDB, qSchema, rp.qRole)
+			if err := rp.execQuery(query); err != nil {
+				errStr := strings.ToLower(err.Error())
+				if strings.Contains(errStr, "does not exist") || strings.Contains(errStr, "not authorized") {
+					rp.logger.Warn("Schema does not exist or not authorized for USAGE grant, skipping", "schema", objectName, "error", err)
+					continue
 				}
-			} else {
-				for _, grant := range sch.Grants {
-					grant = strings.ToUpper(grant)
-					var query, action string
-					if sch.Remove {
-						query = fmt.Sprintf("REVOKE %s ON SCHEMA %s.%s FROM ROLE %s", grant, qDB, qSchema, rp.qRole)
-						action = "revoke"
-					} else {
-						query = fmt.Sprintf("GRANT %s ON SCHEMA %s.%s TO ROLE %s", grant, qDB, qSchema, rp.qRole)
-						action = "grant"
-					}
-					if err := rp.execPrivilegeQuery(query, action, "schema", objectName, grant, rp.dryRun); err != nil {
-						return fmt.Errorf("failed to %s %s on schema %s from/to role %s: %w", action, grant, objectName, rp.roleName, err)
-					}
-				}
+				return fmt.Errorf("failed to grant USAGE on schema %s to role %s: %w", objectName, rp.roleName, err)
 			}
 		}
-		if matched == 0 {
-			rp.logger.Warn("No schemas matched pattern", "pattern", schemaPattern, "database", dbName)
-		}
+		return nil
 	}
 
-	// Process table permissions
+	// Tables: handle USAGE on all schemas and future grants
 	for _, tbl := range role.Permissions.Tables {
 		nameParts := strings.SplitN(tbl.Name, ".", 3)
 		if len(nameParts) < 3 {
@@ -579,114 +521,37 @@ func (rp *RoleProcessor) permissionProcess(role Role) error {
 		}
 		dbName, schemaPattern, tablePattern := strings.ToUpper(nameParts[0]), nameParts[1], nameParts[2]
 
-		// If pattern is *.* (all schemas and all tables), grant USAGE on all schemas first
 		if schemaPattern == "*" && tablePattern == "*" {
-			schemas, err := rp.GetSchemasInDatabase(dbName)
-			if err != nil {
-				rp.logger.Error("Could not fetch schemas for USAGE grant", "database", dbName, "error", err)
-			} else {
-				for _, schema := range schemas {
-					qDB := quoteIdentifier(dbName)
-					qSchema := quoteIdentifier(schema)
-					objectName := fmt.Sprintf("%s.%s", dbName, schema)
-					query := fmt.Sprintf("GRANT USAGE ON SCHEMA %s.%s TO ROLE %s", qDB, qSchema, rp.qRole)
-					err := rp.execPrivilegeQuery(query, "grant", "schema", objectName, "USAGE", rp.dryRun)
-					if err != nil {
-						errStr := strings.ToLower(err.Error())
-						if strings.Contains(errStr, "does not exist") || strings.Contains(errStr, "not authorized") {
-							rp.logger.Warn("Schema does not exist or not authorized for USAGE grant, skipping", "schema", objectName, "error", err)
-							continue
-						}
-						return fmt.Errorf("failed to grant USAGE on schema %s to role %s: %w", objectName, rp.roleName, err)
-					}
-				}
+			if err := grantUsageOnAllSchemas(dbName); err != nil {
+				return err
 			}
 		}
-		// Grant future privileges if tablePattern == "*"
+
 		if tablePattern == "*" {
-			qDB := quoteIdentifier(dbName)
 			schemas, err := rp.GetSchemasInDatabase(dbName)
 			if err != nil {
 				rp.logger.Error("Could not fetch schemas for future grants", "database", dbName, "error", err)
-			} else {
-				for _, schema := range schemas {
-					if !patternMatches(schemaPattern, schema) {
-						continue
-					}
-					qSchema := quoteIdentifier(schema)
-					objectName := fmt.Sprintf("%s.%s", dbName, schema)
-					for _, grant := range tbl.Grants {
-						grant = strings.ToUpper(grant)
-						query := fmt.Sprintf("GRANT %s ON FUTURE TABLES IN SCHEMA %s.%s TO ROLE %s", grant, qDB, qSchema, rp.qRole)
-						err := rp.execPrivilegeQuery(query, "grant", "future_table", objectName, grant, rp.dryRun)
-						if err != nil {
-							rp.logger.Warn("Failed to grant future privilege on tables", "schema", objectName, "privilege", grant, "error", err)
-						}
-					}
-				}
-			}
-		}
-		tablesBySchema, err := rp.GetTablesInDatabase(dbName)
-		if err != nil {
-			rp.logger.Error("Could not fetch tables", "database", dbName, "error", err)
-			continue
-		}
-
-		matched := 0
-		for schema, tables := range tablesBySchema {
-			if !patternMatches(schemaPattern, schema) {
 				continue
 			}
-			for _, table := range tables {
-				if !patternMatches(tablePattern, table) {
+			qDB := quoteIdentifier(dbName)
+			for _, schemaName := range schemas {
+				if !patternMatches(schemaPattern, schemaName) {
 					continue
 				}
-				matched++
-				qDB := quoteIdentifier(dbName)
-				qSchema := quoteIdentifier(schema)
-				qTable := quoteIdentifier(table)
-				objectName := fmt.Sprintf("%s.%s.%s", dbName, schema, table)
-				if tbl.Remove && len(tbl.Grants) == 0 {
-					query := fmt.Sprintf("REVOKE ALL PRIVILEGES ON TABLE %s.%s.%s FROM ROLE %s", qDB, qSchema, qTable, rp.qRole)
-					action := "revoke"
-					err := rp.execPrivilegeQuery(query, action, "table", objectName, "ALL PRIVILEGES", rp.dryRun)
-					if err != nil {
-						errStr := strings.ToLower(err.Error())
-						if strings.Contains(errStr, "does not exist") || strings.Contains(errStr, "not authorized") {
-							rp.logger.Warn("Table does not exist or not authorized, skipping", "table", objectName, "error", err)
-							continue
-						}
-						return fmt.Errorf("failed to revoke all privileges on table %s from role %s: %w", objectName, rp.roleName, err)
-					}
-				} else {
-					for _, grant := range tbl.Grants {
-						grant = strings.ToUpper(grant)
-						var query, action string
-						if tbl.Remove {
-							query = fmt.Sprintf("REVOKE %s ON TABLE %s.%s.%s FROM ROLE %s", grant, qDB, qSchema, qTable, rp.qRole)
-							action = "revoke"
-						} else {
-							query = fmt.Sprintf("GRANT %s ON TABLE %s.%s.%s TO ROLE %s", grant, qDB, qSchema, qTable, rp.qRole)
-							action = "grant"
-						}
-						err := rp.execPrivilegeQuery(query, action, "table", objectName, grant, rp.dryRun)
-						if err != nil {
-							errStr := strings.ToLower(err.Error())
-							if strings.Contains(errStr, "does not exist") || strings.Contains(errStr, "not authorized") {
-								rp.logger.Warn("Table does not exist or not authorized, skipping", "table", objectName, "error", err)
-								continue
-							}
-							return fmt.Errorf("failed to %s %s on table %s from/to role %s: %w", action, grant, objectName, rp.roleName, err)
-						}
+				qSchema := quoteIdentifier(schemaName)
+				objectName := fmt.Sprintf("%s.%s", dbName, schemaName)
+				for _, privilege := range tbl.Grants {
+					privilege = strings.ToUpper(privilege)
+					query := fmt.Sprintf("GRANT %s ON FUTURE TABLES IN SCHEMA %s.%s TO ROLE %s", privilege, qDB, qSchema, rp.qRole)
+					if err := rp.execQuery(query); err != nil {
+						rp.logger.Warn("Failed to grant future privilege on tables", "schema", objectName, "privilege", privilege, "error", err)
 					}
 				}
 			}
 		}
-		if matched == 0 {
-			rp.logger.Warn("No tables matched pattern", "pattern", tbl.Name, "database", dbName)
-		}
 	}
-	// Process view permissions
+
+	// Views: handle USAGE on all schemas and future grants
 	for _, vw := range role.Permissions.Views {
 		nameParts := strings.SplitN(vw.Name, ".", 3)
 		if len(nameParts) < 3 {
@@ -695,112 +560,113 @@ func (rp *RoleProcessor) permissionProcess(role Role) error {
 		}
 		dbName, schemaPattern, viewPattern := strings.ToUpper(nameParts[0]), nameParts[1], nameParts[2]
 
-		// If pattern is *.* (all schemas and all views), grant USAGE on all schemas first
 		if schemaPattern == "*" && viewPattern == "*" {
-			schemas, err := rp.GetSchemasInDatabase(dbName)
-			if err != nil {
-				rp.logger.Error("Could not fetch schemas for USAGE grant (views)", "database", dbName, "error", err)
-			} else {
-				for _, schema := range schemas {
-					qDB := quoteIdentifier(dbName)
-					qSchema := quoteIdentifier(schema)
-					objectName := fmt.Sprintf("%s.%s", dbName, schema)
-					query := fmt.Sprintf("GRANT USAGE ON SCHEMA %s.%s TO ROLE %s", qDB, qSchema, rp.qRole)
-					err := rp.execPrivilegeQuery(query, "grant", "schema", objectName, "USAGE", rp.dryRun)
-					if err != nil {
-						errStr := strings.ToLower(err.Error())
-						if strings.Contains(errStr, "does not exist") || strings.Contains(errStr, "not authorized") {
-							rp.logger.Warn("Schema does not exist or not authorized for USAGE grant (views), skipping", "schema", objectName, "error", err)
-							continue
-						}
-						return fmt.Errorf("failed to grant USAGE on schema %s to role %s: %w", objectName, rp.roleName, err)
-					}
-				}
+			if err := grantUsageOnAllSchemas(dbName); err != nil {
+				return err
 			}
 		}
-		// Grant future privileges if viewPattern == "*"
+
 		if viewPattern == "*" {
-			qDB := quoteIdentifier(dbName)
 			schemas, err := rp.GetSchemasInDatabase(dbName)
 			if err != nil {
 				rp.logger.Error("Could not fetch schemas for future grants (views)", "database", dbName, "error", err)
-			} else {
-				for _, schema := range schemas {
-					if !patternMatches(schemaPattern, schema) {
-						continue
-					}
-					qSchema := quoteIdentifier(schema)
-					objectName := fmt.Sprintf("%s.%s", dbName, schema)
-					for _, grant := range vw.Grants {
-						grant = strings.ToUpper(grant)
-						query := fmt.Sprintf("GRANT %s ON FUTURE VIEWS IN SCHEMA %s.%s TO ROLE %s", grant, qDB, qSchema, rp.qRole)
-						err := rp.execPrivilegeQuery(query, "grant", "future_view", objectName, grant, rp.dryRun)
-						if err != nil {
-							rp.logger.Warn("Failed to grant future privilege on views", "schema", objectName, "privilege", grant, "error", err)
-						}
-					}
-				}
-			}
-		}
-		viewsBySchema, err := rp.GetViewsInDatabase(dbName)
-		if err != nil {
-			rp.logger.Error("Could not fetch views", "database", dbName, "error", err)
-			continue
-		}
-		matched := 0
-		for schema, views := range viewsBySchema {
-			if !patternMatches(schemaPattern, schema) {
 				continue
 			}
-			for _, view := range views {
-				if !patternMatches(viewPattern, view) {
+			qDB := quoteIdentifier(dbName)
+			for _, schemaName := range schemas {
+				if !patternMatches(schemaPattern, schemaName) {
 					continue
 				}
-				matched++
-				qDB := quoteIdentifier(dbName)
-				qSchema := quoteIdentifier(schema)
-				qView := quoteIdentifier(view)
-				objectName := fmt.Sprintf("%s.%s.%s", dbName, schema, view)
-				if vw.Remove && len(vw.Grants) == 0 {
-					query := fmt.Sprintf("REVOKE ALL PRIVILEGES ON VIEW %s.%s.%s FROM ROLE %s", qDB, qSchema, qView, rp.qRole)
-					action := "revoke"
-					err := rp.execPrivilegeQuery(query, action, "view", objectName, "ALL PRIVILEGES", rp.dryRun)
-					if err != nil {
-						errStr := strings.ToLower(err.Error())
-						if strings.Contains(errStr, "does not exist") || strings.Contains(errStr, "not authorized") {
-							rp.logger.Warn("View does not exist or not authorized, skipping", "view", objectName, "error", err)
-							continue
-						}
-						return fmt.Errorf("failed to revoke all privileges on view %s from role %s: %w", objectName, rp.roleName, err)
+				qSchema := quoteIdentifier(schemaName)
+				objectName := fmt.Sprintf("%s.%s", dbName, schemaName)
+				for _, privilege := range vw.Grants {
+					privilege = strings.ToUpper(privilege)
+					query := fmt.Sprintf("GRANT %s ON FUTURE VIEWS IN SCHEMA %s.%s TO ROLE %s", privilege, qDB, qSchema, rp.qRole)
+					if err := rp.execQuery(query); err != nil {
+						rp.logger.Warn("Failed to grant future privilege on views", "schema", objectName, "privilege", privilege, "error", err)
 					}
-				} else {
-					for _, grant := range vw.Grants {
-						grant = strings.ToUpper(grant)
-						var query, action string
-						if vw.Remove {
-							query = fmt.Sprintf("REVOKE %s ON VIEW %s.%s.%s FROM ROLE %s", grant, qDB, qSchema, qView, rp.qRole)
-							action = "revoke"
-						} else {
-							query = fmt.Sprintf("GRANT %s ON VIEW %s.%s.%s TO ROLE %s", grant, qDB, qSchema, qView, rp.qRole)
-							action = "grant"
-						}
-						err := rp.execPrivilegeQuery(query, action, "view", objectName, grant, rp.dryRun)
+				}
+			}
+		}
+	}
+
+	// Explicitly revoke future grants if no wildcard pattern is present in config
+	// Build a set of (db, schema) for which a wildcard future grant is desired for tables/views
+	dbSchemaFutureTables := make(map[string]struct{})
+	dbSchemaFutureViews := make(map[string]struct{})
+	for _, tbl := range role.Permissions.Tables {
+		nameParts := strings.SplitN(tbl.Name, ".", 3)
+		if len(nameParts) == 3 {
+			db, schema, table := strings.ToUpper(nameParts[0]), nameParts[1], nameParts[2]
+			if table == "*" {
+				key := db + "." + schema
+				dbSchemaFutureTables[key] = struct{}{}
+			}
+		}
+	}
+	for _, vw := range role.Permissions.Views {
+		nameParts := strings.SplitN(vw.Name, ".", 3)
+		if len(nameParts) == 3 {
+			db, schema, view := strings.ToUpper(nameParts[0]), nameParts[1], nameParts[2]
+			if view == "*" {
+				key := db + "." + schema
+				dbSchemaFutureViews[key] = struct{}{}
+			}
+		}
+	}
+
+	// For each database in config, enumerate all schemas and explicitly revoke future grants if not desired
+	current := rp.fetchCurrentGrants()
+	dbSet := make(map[string]struct{})
+	for _, tbl := range role.Permissions.Tables {
+		nameParts := strings.SplitN(tbl.Name, ".", 3)
+		if len(nameParts) == 3 {
+			db := strings.ToUpper(nameParts[0])
+			dbSet[db] = struct{}{}
+		}
+	}
+	for _, vw := range role.Permissions.Views {
+		nameParts := strings.SplitN(vw.Name, ".", 3)
+		if len(nameParts) == 3 {
+			db := strings.ToUpper(nameParts[0])
+			dbSet[db] = struct{}{}
+		}
+	}
+	for db := range dbSet {
+		schemas, err := rp.GetSchemasInDatabase(db)
+		if err != nil {
+			rp.logger.Warn("Could not enumerate schemas for explicit future grant revoke", "database", db, "error", err)
+			continue
+		}
+		for _, schema := range schemas {
+			key := db + "." + schema
+			// FUTURE_TABLE
+			if _, want := dbSchemaFutureTables[key]; !want {
+				for gk := range current {
+					if gk.ObjectType == "FUTURE_TABLE" && gk.ObjectName == key {
+						query := rp.buildRevokeQuery(gk)
+						err := rp.execQuery(query)
 						if err != nil {
-							errStr := strings.ToLower(err.Error())
-							if strings.Contains(errStr, "does not exist") || strings.Contains(errStr, "not authorized") {
-								rp.logger.Warn("View does not exist or not authorized, skipping", "view", objectName, "error", err)
-								continue
-							}
-							return fmt.Errorf("failed to %s %s on view %s from/to role %s: %w", action, grant, objectName, rp.roleName, err)
+							rp.logger.Warn("Explicitly revoked future table grant", "query", query, "error", err)
+						}
+					}
+				}
+			}
+			// FUTURE_VIEW
+			if _, want := dbSchemaFutureViews[key]; !want {
+				for gk := range current {
+					if gk.ObjectType == "FUTURE_VIEW" && gk.ObjectName == key {
+						query := rp.buildRevokeQuery(gk)
+						err := rp.execQuery(query)
+						if err != nil {
+							rp.logger.Warn("Explicitly revoked future view grant", "query", query, "error", err)
 						}
 					}
 				}
 			}
 		}
-		if matched == 0 {
-			rp.logger.Warn("No views matched pattern", "pattern", vw.Name, "database", dbName)
-		}
 	}
+
 	return nil
 }
 
@@ -825,7 +691,7 @@ func (rp *RoleProcessor) Process() error {
 			if _, exists := rp.existingRoles[upperRole]; exists {
 				dropRoleQuery := "DROP ROLE IF EXISTS " + rp.qRole
 				if rp.dryRun {
-					rp.logger.Info("[DryRun] Would drop role", "query", dropRoleQuery, "role", rp.roleName)
+					rp.logger.Info("[DryRun] Would drop role", "query", dropRoleQuery)
 				} else {
 					rp.logger.Info("Dropping role", "query", dropRoleQuery, "role", rp.roleName)
 					if _, err := rp.db.ExecContext(ctx, dropRoleQuery); err != nil {
@@ -844,6 +710,9 @@ func (rp *RoleProcessor) Process() error {
 			rp.existingRoles[upperRole] = struct{}{}
 			rolesCreated++
 		}
+
+		// fetch current grants ONCE for this role
+		rp.currentGrants = rp.fetchCurrentGrants()
 
 		// process warehouse creation and grants, except for system-defined roles
 		if _, isSystem := systemRoles[rp.roleName]; !isSystem {
@@ -864,8 +733,13 @@ func (rp *RoleProcessor) Process() error {
 		}
 
 		// process permissions
-		if err := rp.permissionProcess(role); err != nil {
+		if err := rp.applySpecialGrants(role); err != nil {
 			return fmt.Errorf("failed to process permissions for role %s: %w", rp.roleName, err)
+		}
+
+		// sync grants/revokes based on config
+		if err := rp.syncRoleGrants(role); err != nil {
+			return fmt.Errorf("failed to sync grants for role %s: %w", rp.roleName, err)
 		}
 	}
 
@@ -1144,4 +1018,181 @@ func (rp *RoleProcessor) FetchRoleGrants(roleName string) ([]FetchedRoleGrant, e
 		return nil, fmt.Errorf("iteration error on SHOW GRANTS TO ROLE: %w", err)
 	}
 	return results, nil
+}
+
+// Compute set difference a - b
+func difference(a, b map[GrantKey]struct{}) map[GrantKey]struct{} {
+	result := make(map[GrantKey]struct{})
+	for k := range a {
+		if _, ok := b[k]; !ok {
+			result[k] = struct{}{}
+		}
+	}
+	return result
+}
+
+// Build GrantKey set from config, expanding wildcards for tables/views
+func (rp *RoleProcessor) buildDesiredGrantsFromConfig(role Role) map[GrantKey]struct{} {
+	rp.logger.Info("Building desired grants from config", "role", role.Name)
+	grants := make(map[GrantKey]struct{})
+	if role.Permissions == nil {
+		return grants
+	}
+	// Databases
+	for _, db := range role.Permissions.Databases {
+		for _, priv := range db.Grants {
+			gk := GrantKey{Privilege: strings.ToUpper(priv), ObjectType: "DATABASE", ObjectName: normalizeObjectName(db.Name)}
+			grants[gk] = struct{}{}
+		}
+	}
+	// Schemas
+	for _, sch := range role.Permissions.Schemas {
+		for _, priv := range sch.Grants {
+			gk := GrantKey{Privilege: strings.ToUpper(priv), ObjectType: "SCHEMA", ObjectName: normalizeObjectName(sch.Name)}
+			grants[gk] = struct{}{}
+		}
+	}
+
+	// --- Caching for tables/views ---
+	tablesCache := make(map[string]map[string][]string)
+	viewsCache := make(map[string]map[string][]string)
+
+	// Tables (expand wildcards to all real tables)
+	for _, tbl := range role.Permissions.Tables {
+		nameParts := strings.SplitN(tbl.Name, ".", 3)
+		if len(nameParts) < 3 {
+			continue
+		}
+		dbName, schemaPattern, tablePattern := strings.ToUpper(nameParts[0]), nameParts[1], nameParts[2]
+		var tablesBySchema map[string][]string
+		var ok bool
+		if tablesBySchema, ok = tablesCache[dbName]; !ok {
+			t, err := rp.GetTablesInDatabase(dbName)
+			if err != nil {
+				continue
+			}
+			tablesBySchema = t
+			tablesCache[dbName] = t
+		}
+		for schema, tables := range tablesBySchema {
+			if !patternMatches(schemaPattern, schema) {
+				continue
+			}
+			for _, table := range tables {
+				if !patternMatches(tablePattern, table) {
+					continue
+				}
+				objectName := normalizeObjectName(fmt.Sprintf("%s.%s.%s", dbName, schema, table))
+				for _, priv := range tbl.Grants {
+					gk := GrantKey{Privilege: strings.ToUpper(priv), ObjectType: "TABLE", ObjectName: objectName}
+					grants[gk] = struct{}{}
+				}
+			}
+		}
+	}
+	// Views (expand wildcards to all real views)
+	for _, vw := range role.Permissions.Views {
+		nameParts := strings.SplitN(vw.Name, ".", 3)
+		if len(nameParts) < 3 {
+			continue
+		}
+		dbName, schemaPattern, viewPattern := strings.ToUpper(nameParts[0]), nameParts[1], nameParts[2]
+		var viewsBySchema map[string][]string
+		var ok bool
+		if viewsBySchema, ok = viewsCache[dbName]; !ok {
+			v, err := rp.GetViewsInDatabase(dbName)
+			if err != nil {
+				continue
+			}
+			viewsBySchema = v
+			viewsCache[dbName] = v
+		}
+		for schema, views := range viewsBySchema {
+			if !patternMatches(schemaPattern, schema) {
+				continue
+			}
+			for _, view := range views {
+				if !patternMatches(viewPattern, view) {
+					continue
+				}
+				objectName := normalizeObjectName(fmt.Sprintf("%s.%s.%s", dbName, schema, view))
+				for _, priv := range vw.Grants {
+					gk := GrantKey{Privilege: strings.ToUpper(priv), ObjectType: "VIEW", ObjectName: objectName}
+					grants[gk] = struct{}{}
+				}
+			}
+		}
+	}
+
+	// Add warehouse usage grant as part of desired grants because it is a default requirement
+	warehouseName := rp.roleName + "_WAREHOUSE"
+	gk := GrantKey{
+		Privilege:  "USAGE",
+		ObjectType: "WAREHOUSE",
+		ObjectName: strings.ToUpper(warehouseName),
+	}
+	grants[gk] = struct{}{}
+
+	return grants
+}
+
+// Build GrantKey set from current grants
+func (rp *RoleProcessor) fetchCurrentGrants() map[GrantKey]struct{} {
+	result := make(map[GrantKey]struct{})
+	grantRows, err := rp.FetchRoleGrants(rp.roleName)
+	if err != nil {
+		rp.logger.Error("Failed to fetch current grants", "role", rp.roleName, "error", err)
+		return result
+	}
+	for _, g := range grantRows {
+		gk := GrantKey{Privilege: strings.ToUpper(g.Privilege), ObjectType: strings.ToUpper(g.GrantedOn), ObjectName: normalizeObjectName(g.Name)}
+		result[gk] = struct{}{}
+	}
+	return result
+}
+
+// Build GRANT statement from GrantKey
+func (rp *RoleProcessor) buildGrantStatement(g GrantKey) string {
+	return fmt.Sprintf("GRANT %s ON %s %s TO ROLE %s", g.Privilege, g.ObjectType, g.ObjectName, rp.qRole)
+}
+
+// Build REVOKE statement from GrantKey
+func (rp *RoleProcessor) buildRevokeQuery(g GrantKey) string {
+	return fmt.Sprintf("REVOKE %s ON %s %s FROM ROLE %s", g.Privilege, g.ObjectType, g.ObjectName, rp.qRole)
+}
+
+// Main sync logic
+func (rp *RoleProcessor) syncRoleGrants(role Role) error {
+	// If no permissions in config, skip all revokes
+	if (role.Name == "ACCOUNTADMIN" || role.Name == "ORGADMIN" ||
+		role.Name == "SYSADMIN" || role.Name == "SECURITYADMIN" || role.Name == "USERADMIN") ||
+		role.Permissions == nil || (len(role.Permissions.Databases) == 0 &&
+		len(role.Permissions.Schemas) == 0 &&
+		len(role.Permissions.Tables) == 0 &&
+		len(role.Permissions.Views) == 0) {
+		return nil
+	}
+
+	current := rp.currentGrants
+	desired := rp.buildDesiredGrantsFromConfig(role)
+	toAdd := difference(desired, current)
+	toRevoke := difference(current, desired)
+
+	for gk := range toAdd {
+		stmt := rp.buildGrantStatement(gk)
+		err := rp.execQuery(stmt)
+		if err != nil {
+			rp.logger.Warn("Failed to grant", "stmt", stmt, "error", err)
+			return err
+		}
+	}
+	for gk := range toRevoke {
+		stmt := rp.buildRevokeQuery(gk)
+		err := rp.execQuery(stmt)
+		if err != nil {
+			rp.logger.Warn("Failed to revoke", "stmt", stmt, "error", err)
+			return err
+		}
+	}
+	return nil
 }
