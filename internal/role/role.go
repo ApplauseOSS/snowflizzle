@@ -344,6 +344,15 @@ func quoteIdentifier(id string) string {
 	return `"` + esc + `"`
 }
 
+// quoteObjectName quotes each part of a dot-separated object name (e.g., DB.SCHEMA.TABLE)
+func quoteObjectName(objectName string) string {
+	parts := strings.Split(objectName, ".")
+	for i, part := range parts {
+		parts[i] = quoteIdentifier(part)
+	}
+	return strings.Join(parts, ".")
+}
+
 func (rp *RoleProcessor) createRoleIfNotExists() error {
 	createRoleQuery := "CREATE ROLE IF NOT EXISTS " + rp.qRole
 	if err := rp.execQuery(createRoleQuery); err != nil {
@@ -1153,12 +1162,12 @@ func (rp *RoleProcessor) fetchCurrentGrants() map[GrantKey]struct{} {
 
 // Build GRANT statement from GrantKey
 func (rp *RoleProcessor) buildGrantStatement(g GrantKey) string {
-	return fmt.Sprintf("GRANT %s ON %s %s TO ROLE %s", g.Privilege, g.ObjectType, g.ObjectName, rp.qRole)
+	return fmt.Sprintf("GRANT %s ON %s %s TO ROLE %s", g.Privilege, g.ObjectType, quoteObjectName(g.ObjectName), rp.qRole)
 }
 
 // Build REVOKE statement from GrantKey
 func (rp *RoleProcessor) buildRevokeQuery(g GrantKey) string {
-	return fmt.Sprintf("REVOKE %s ON %s %s FROM ROLE %s", g.Privilege, g.ObjectType, g.ObjectName, rp.qRole)
+	return fmt.Sprintf("REVOKE %s ON %s %s FROM ROLE %s", g.Privilege, g.ObjectType, quoteObjectName(g.ObjectName), rp.qRole)
 }
 
 // Main sync logic
