@@ -747,9 +747,7 @@ func (rp *RoleProcessor) Process() error {
 		}
 
 		// sync grants/revokes based on config
-		if err := rp.syncRoleGrants(role); err != nil {
-			return fmt.Errorf("failed to sync grants for role %s: %w", rp.roleName, err)
-		}
+		rp.syncRoleGrants(role)
 	}
 
 	rp.logger.InfoContext(context.Background(), "Grant summary",
@@ -1171,7 +1169,7 @@ func (rp *RoleProcessor) buildRevokeQuery(g GrantKey) string {
 }
 
 // Main sync logic
-func (rp *RoleProcessor) syncRoleGrants(role Role) error {
+func (rp *RoleProcessor) syncRoleGrants(role Role) {
 	// If no permissions in config, skip all revokes
 	if (role.Name == "ACCOUNTADMIN" || role.Name == "ORGADMIN" ||
 		role.Name == "SYSADMIN" || role.Name == "SECURITYADMIN" || role.Name == "USERADMIN") ||
@@ -1179,7 +1177,7 @@ func (rp *RoleProcessor) syncRoleGrants(role Role) error {
 		len(role.Permissions.Schemas) == 0 &&
 		len(role.Permissions.Tables) == 0 &&
 		len(role.Permissions.Views) == 0) {
-		return nil
+		return
 	}
 
 	current := rp.currentGrants
@@ -1202,7 +1200,6 @@ func (rp *RoleProcessor) syncRoleGrants(role Role) error {
 		err := rp.execQuery(stmt)
 		if err != nil {
 			rp.logger.WarnContext(context.Background(), "Failed to grant", "stmt", stmt, "error", err)
-			return err
 		}
 	}
 	for gk := range toRevoke {
@@ -1210,8 +1207,6 @@ func (rp *RoleProcessor) syncRoleGrants(role Role) error {
 		err := rp.execQuery(stmt)
 		if err != nil {
 			rp.logger.WarnContext(context.Background(), "Failed to revoke", "stmt", stmt, "error", err)
-			return err
 		}
 	}
-	return nil
 }
