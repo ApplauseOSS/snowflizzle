@@ -695,6 +695,11 @@ func (rp *RoleProcessor) Process() error {
 		rp.qRole = quoteIdentifier(upperRole)
 		rp.roleName = upperRole
 
+		if err := rp.ValidateConfigObjects(role); err != nil {
+			rp.logger.ErrorContext(context.Background(), "Configuration validation issue", "role", role.Name, "error", err)
+			return err
+		}
+
 		if role.Remove {
 			// If the role exists, drop it
 			if _, exists := rp.existingRoles[upperRole]; exists {
@@ -936,6 +941,52 @@ func ValidateRolesConfig(rc *RolesConfig) error {
 			}
 		}
 		// TODO Optionally validate permissions structure here if needed
+	}
+	return nil
+}
+
+// ValidateConfigObjects checks that all referenced objects in the Role configuration exist in Snowflake.
+func (rp *RoleProcessor) ValidateConfigObjects(role Role) error {
+	if role.Permissions == nil {
+		return nil
+	}
+	var errs []error
+	// Collect all referenced databases and schemas
+	dbSchemas := make(map[string][]string)
+	for _, db := range role.Permissions.Databases {
+		dbName := strings.ToUpper(db.Name)
+		dbSchemas[dbName] = append(dbSchemas[dbName], "")
+	}
+	for _, sch := range role.Permissions.Schemas {
+		nameParts := strings.SplitN(sch.Name, ".", 2)
+		if len(nameParts) != 2 {
+			continue
+		}
+		dbName, schemaName := strings.ToUpper(nameParts[0]), nameParts[1]
+		dbSchemas[dbName] = append(dbSchemas[dbName], schemaName)
+	}
+	for dbName, schemas := range dbSchemas {
+		allSchemas, err := rp.GetSchemasInDatabase(dbName)
+		if err != nil {
+			rp.logger.ErrorContext(context.Background(), "Database doesn't exist", "database", dbName, "error", err)
+			errs = append(errs, fmt.Errorf("database %s does not exist: %w", dbName, err))
+		}
+		schemaSet := make(map[string]struct{})
+		for _, s := range allSchemas {
+			schemaSet[strings.ToUpper(s)] = struct{}{}
+		}
+		for _, schemaName := range schemas {
+			if schemaName == "" || schemaName == "*" {
+				continue
+			}
+			if _, found := schemaSet[strings.ToUpper(schemaName)]; !found {
+				rp.logger.WarnContext(context.Background(), "Schema does not exist in database", "database", dbName, "schema", schemaName)
+				errs = append(errs, fmt.Errorf("schema %s does not exist in database %s", schemaName, dbName))
+			}
+		}
+	}
+	if len(errs) > 0 {
+		return errors.New("configuration validation errors")
 	}
 	return nil
 }
