@@ -1,11 +1,11 @@
 # Snowflizzle
 
-Snowflizzle is a tool for declaratively managing Snowflake roles, users, and their permissions using a YAML configuration file. It enables mapping users (by login name or email) to Snowflake roles, and automates the granting and revoking of database, schema, and table privileges, including support for wildcards and partial name matching. The tool is designed for automation and integrates with Snowflake using a service user and key-pair authentication.
+Snowflizzle is a tool for declaratively managing Snowflake roles, users, and their permissions using a YAML configuration file. It enables mapping users (by login name or email) to Snowflake roles, and automates the granting and revoking of database, schema, table, and workspace privileges, including support for wildcards and partial name matching. The tool is designed for automation and integrates with Snowflake using a service user and key-pair authentication.
 
 ## Key Features
 
 - Declarative YAML configuration for roles, members, and permissions
-- Grant and revoke privileges on databases, schemas, and tables
+- Grant and revoke privileges on databases, schemas, tables, views, and workspaces
 - Supports wildcard and partial matching for schema and table names
 - Dry-run mode for previewing changes without applying them
 - Validation of configuration files before applying changes
@@ -22,7 +22,7 @@ roles:
       - email: exemployee2@example.com
         removed: true
     permissions:
-    # Option for names
+      # Option for names
       # - database_name
       databases:
         - name: test_a_db
@@ -31,26 +31,56 @@ roles:
         - name: test_b_db
           remove: true
       schemas:
-      # Options for names
-      # - database_name.schema_name
-      # - database_name.*
-      # - database_name.*schema_partial
-      # - database_name.schema_partial*
+        # Options for names
+        # - database_name.schema_name
+        # - database_name.*
+        # - database_name.*schema_partial
+        # - database_name.schema_partial*
         - name: test_c_db.credentials
           grants:
             - USAGE
         - name: test_b_db.assets
       tables:
-      # Options for names
-      # - database_name.*.*
-      # - database_name.schema_name.*
-      # - database_name.schema_partial_*.*
-      # - database_name.*_schema_partial.*
-      # - database_name.schema_name.table_name
+        # Options for names
+        # - database_name.*.*
+        # - database_name.schema_name.*
+        # - database_name.schema_partial_*.*
+        # - database_name.*_schema_partial.*
+        # - database_name.schema_name.table_name
         - name: test_c_db.credentials
           grants:
             - SELECT
         - name: test_b_db.*.*
+      workspaces:
+        # Name must be a 3-part identifier: database_name.schema_name.workspace_name
+        # Quote the value if the workspace name contains spaces.
+        # Supported grants: USAGE, READ, WRITE
+        - name: "test_a_db.my_schema.My Workspace"
+          grants:
+            - USAGE
+            - READ
+            - WRITE
+```
+
+### Workspace grants
+
+Snowflake [workspaces](https://docs.snowflake.com/en/user-guide/ui-snowsight-workspaces) are managed under the `workspaces` key in `permissions`. Each entry requires a 3-part name (`DATABASE.SCHEMA.WORKSPACE_NAME`) and one or more of the following privileges:
+
+| Privilege | Description                                  |
+| --------- | -------------------------------------------- |
+| `USAGE`   | Allows the role to see the workspace         |
+| `READ`    | Allows the role to read workspace contents   |
+| `WRITE`   | Allows the role to modify workspace contents |
+
+If a workspace name contains spaces, wrap the entire `name` value in single quotes:
+
+```yaml
+workspaces:
+  - name: "MY_DATABASE.MY_SCHEMA.SALESOPS WORKSPACE"
+    grants:
+      - USAGE
+      - READ
+      - WRITE
 ```
 
 Prepare snowflizzle service user in snowflake

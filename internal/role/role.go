@@ -76,12 +76,21 @@ type ViewPermission struct {
 	Remove bool     `yaml:"remove,omitempty"`
 }
 
-// RolePermissions represents permissions for a role, including databases, schemas, tables, and views.
+// WorkspacePermission represents a Snowflake workspace permission entry.
+// Example: { name: "MYDB.MYSCHEMA.MY WORKSPACE", grants: ["USAGE", "READ", "WRITE"] }
+type WorkspacePermission struct {
+	Name   string   `yaml:"name"`
+	Grants []string `yaml:"grants,omitempty"`
+	Remove bool     `yaml:"remove,omitempty"`
+}
+
+// RolePermissions represents permissions for a role, including databases, schemas, tables, views, and workspaces.
 type RolePermissions struct {
-	Databases []DatabasePermission `yaml:"databases,omitempty"`
-	Schemas   []SchemaPermission   `yaml:"schemas,omitempty"`
-	Tables    []TablePermission    `yaml:"tables,omitempty"`
-	Views     []ViewPermission     `yaml:"views,omitempty"`
+	Databases  []DatabasePermission  `yaml:"databases,omitempty"`
+	Schemas    []SchemaPermission    `yaml:"schemas,omitempty"`
+	Tables     []TablePermission     `yaml:"tables,omitempty"`
+	Views      []ViewPermission      `yaml:"views,omitempty"`
+	Workspaces []WorkspacePermission `yaml:"workspaces,omitempty"`
 }
 
 // Role represents a single role entry in the YAML configuration.
@@ -477,7 +486,7 @@ func (rp *RoleProcessor) memberProcess(role Role) (usersSkipped int, err error) 
 			return usersSkipped, err
 		}
 	}
-	return
+	return usersSkipped, err
 }
 
 func (rp *RoleProcessor) execQuery(query string) error {
@@ -703,7 +712,7 @@ func (rp *RoleProcessor) Process() error {
 		if role.Remove {
 			// If the role exists, drop it
 			if _, exists := rp.existingRoles[upperRole]; exists {
-				dropRoleQuery := "DROP ROLE IF EXISTS " + rp.qRole
+				dropRoleQuery := "DROP ROLE IF EXISTS " + rp.qRole //nolint:gosec // G202: role name is safely quoted by quoteIdentifier
 				if rp.dryRun {
 					rp.logger.InfoContext(context.Background(), "[DryRun] Would drop role", "query", dropRoleQuery)
 				} else {
@@ -781,7 +790,7 @@ func (rp *RoleProcessor) FindNonExistentRoles() []string {
 // GetSchemasInDatabase fetches all schemas in a given database.
 func (rp *RoleProcessor) GetSchemasInDatabase(dbName string) ([]string, error) {
 	ctx := context.Background()
-	query := "SHOW SCHEMAS IN DATABASE " + quoteIdentifier(dbName)
+	query := "SHOW SCHEMAS IN DATABASE " + quoteIdentifier(dbName) //nolint:gosec // G202: dbName is safely quoted by quoteIdentifier
 	rows, err := rp.db.QueryContext(ctx, query)
 	if err != nil {
 		rp.logger.ErrorContext(context.Background(), "SHOW SCHEMAS failed", "database", dbName, "error", err)
@@ -839,7 +848,7 @@ func patternMatches(pattern, candidate string) bool {
 // GetTablesInDatabase fetches all tables in a given database, grouped by schema.
 func (rp *RoleProcessor) GetTablesInDatabase(dbName string) (map[string][]string, error) {
 	ctx := context.Background()
-	query := "SHOW TABLES IN DATABASE " + quoteIdentifier(dbName)
+	query := "SHOW TABLES IN DATABASE " + quoteIdentifier(dbName) //nolint:gosec // G202: dbName is safely quoted by quoteIdentifier
 	rows, err := rp.db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, err
@@ -880,7 +889,7 @@ func (rp *RoleProcessor) GetTablesInDatabase(dbName string) (map[string][]string
 // GetViewsInDatabase fetches all views in a given database, grouped by schema.
 func (rp *RoleProcessor) GetViewsInDatabase(dbName string) (map[string][]string, error) {
 	ctx := context.Background()
-	query := "SHOW VIEWS IN DATABASE " + quoteIdentifier(dbName)
+	query := "SHOW VIEWS IN DATABASE " + quoteIdentifier(dbName) //nolint:gosec // G202: dbName is safely quoted by quoteIdentifier
 	rows, err := rp.db.QueryContext(ctx, query)
 	if err != nil {
 		errStr := strings.ToLower(err.Error())
@@ -985,6 +994,14 @@ func (rp *RoleProcessor) ValidateConfigObjects(role Role) error {
 			}
 		}
 	}
+	// Workspaces: validate name is a 3-part identifier (DATABASE.SCHEMA.WORKSPACE)
+	for _, ws := range role.Permissions.Workspaces {
+		parts := strings.SplitN(ws.Name, ".", 3)
+		if len(parts) != 3 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" || strings.TrimSpace(parts[2]) == "" {
+			errs = append(errs, fmt.Errorf("workspace permission name must be in format DATABASE.SCHEMA.WORKSPACE_NAME, got: %q", ws.Name))
+		}
+	}
+
 	if len(errs) > 0 {
 		return errors.New("configuration validation errors")
 	}
@@ -1019,7 +1036,7 @@ func (rp *RoleProcessor) FetchRoleGrants(roleName string) ([]FetchedRoleGrant, e
 	logger := rp.logger
 	ctx := context.Background()
 	qRole := quoteIdentifier(strings.ToUpper(roleName))
-	query := "SHOW GRANTS TO ROLE " + qRole
+	query := "SHOW GRANTS TO ROLE " + qRole //nolint:gosec // G202: role name is safely quoted by quoteIdentifier
 	rows, err := rp.db.QueryContext(ctx, query)
 	if err != nil {
 		logger.ErrorContext(context.Background(), "query SHOW GRANTS TO ROLE failed", "error", err, "role", roleName)
@@ -1182,6 +1199,14 @@ func (rp *RoleProcessor) buildDesiredGrantsFromConfig(role Role) map[GrantKey]st
 		}
 	}
 
+	// Workspaces
+	for _, ws := range role.Permissions.Workspaces {
+		for _, priv := range ws.Grants {
+			gk := GrantKey{Privilege: strings.ToUpper(priv), ObjectType: "WORKSPACE", ObjectName: normalizeObjectName(ws.Name)}
+			grants[gk] = struct{}{}
+		}
+	}
+
 	// Add warehouse usage grant as part of desired grants because it is a default requirement
 	warehouseName := rp.roleName + "_WAREHOUSE"
 	gk := GrantKey{
@@ -1227,7 +1252,8 @@ func (rp *RoleProcessor) syncRoleGrants(role Role) {
 		role.Permissions == nil || (len(role.Permissions.Databases) == 0 &&
 		len(role.Permissions.Schemas) == 0 &&
 		len(role.Permissions.Tables) == 0 &&
-		len(role.Permissions.Views) == 0) {
+		len(role.Permissions.Views) == 0 &&
+		len(role.Permissions.Workspaces) == 0) {
 		return
 	}
 
