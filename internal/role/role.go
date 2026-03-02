@@ -1262,10 +1262,22 @@ func (rp *RoleProcessor) syncRoleGrants(role Role) {
 	toAdd := difference(desired, current)
 	toRevoke := difference(current, desired)
 
-	// Filter out OWNERSHIP grants (cannot be revoked, only transferred)
+	// Only revoke grants for object types this tool explicitly manages.
+	// Leave ROLE grants and any other unmanaged types alone.
+	managedObjectTypes := map[string]struct{}{
+		"DATABASE":  {},
+		"SCHEMA":    {},
+		"TABLE":     {},
+		"VIEW":      {},
+		"WAREHOUSE": {},
+		"WORKSPACE": {},
+	}
 	filteredToRevoke := make(map[GrantKey]struct{})
 	for gk := range toRevoke {
 		if strings.ToUpper(gk.Privilege) == "OWNERSHIP" {
+			continue
+		}
+		if _, managed := managedObjectTypes[strings.ToUpper(gk.ObjectType)]; !managed {
 			continue
 		}
 		filteredToRevoke[gk] = struct{}{}
