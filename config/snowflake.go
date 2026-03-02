@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/applauseoss/snowflizzle/internal/logging"
 	"github.com/joho/godotenv"
@@ -109,7 +110,7 @@ func ConnectToSnowflake() (*sql.DB, error) {
 }
 
 func parsePrivateKeyFromFile(path string) (*rsa.PrivateKey, error) {
-	bytes, err := os.ReadFile(path)
+	bytes, err := os.ReadFile(filepath.Clean(path)) //nolint:gosec // G703: path is sourced from a trusted operator-controlled environment variable
 	if err != nil {
 		return nil, err
 	}
