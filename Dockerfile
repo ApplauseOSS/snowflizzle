@@ -1,6 +1,6 @@
 # Install go into wolfi for build
 FROM cgr.dev/chainguard/wolfi-base AS base
-RUN apk update && apk add ca-certificates-bundle build-base openssh git go-1.24~=1.24.1
+RUN apk update && apk add ca-certificates-bundle build-base openssh git go-1.25
 
 FROM base AS dev
 WORKDIR /code
