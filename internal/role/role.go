@@ -77,20 +77,25 @@ type ViewPermission struct {
 }
 
 // WorkspacePermission represents a Snowflake workspace permission entry.
-// Example: { name: "MYDB.MYSCHEMA.MY WORKSPACE", grants: ["USAGE", "READ", "WRITE"] }
+// Only READ and WRITE are grantable on a workspace (WRITE implies READ).
+// Example: { name: "MYDB.MYSCHEMA.MY WORKSPACE", grants: ["READ", "WRITE"] }
 type WorkspacePermission struct {
 	Name   string   `yaml:"name"`
 	Grants []string `yaml:"grants,omitempty"`
 	Remove bool     `yaml:"remove,omitempty"`
 }
 
-// RolePermissions represents permissions for a role, including databases, schemas, tables, views, and workspaces.
+// RolePermissions represents permissions for a role, including databases, schemas, tables, views,
+// workspaces, and account-level privileges.
 type RolePermissions struct {
 	Databases  []DatabasePermission  `yaml:"databases,omitempty"`
 	Schemas    []SchemaPermission    `yaml:"schemas,omitempty"`
 	Tables     []TablePermission     `yaml:"tables,omitempty"`
 	Views      []ViewPermission      `yaml:"views,omitempty"`
 	Workspaces []WorkspacePermission `yaml:"workspaces,omitempty"`
+	// AccountPrivileges are account-scoped privileges granted directly to the role,
+	// e.g. ["EXECUTE TASK", "EXECUTE ALERT"] -> GRANT EXECUTE TASK ON ACCOUNT TO ROLE <role>.
+	AccountPrivileges []string `yaml:"account_privileges,omitempty"`
 }
 
 // Role represents a single role entry in the YAML configuration.
@@ -283,6 +288,61 @@ func FetchShowWarehouses(db *sql.DB) (map[string]string, error) {
 	return warehouses, nil
 }
 
+// FetchShowWorkspaces returns a set of normalized fully-qualified workspace names (DB.SCHEMA.NAME)
+// from SHOW WORKSPACES IN ACCOUNT. The result only includes workspaces the current role has at
+// least one privilege on (a Snowflake limitation of SHOW WORKSPACES).
+func FetchShowWorkspaces(db *sql.DB) (map[string]struct{}, error) {
+	logger := logging.GetLogger()
+	ctx := context.Background()
+	rows, err := db.QueryContext(ctx, "SHOW WORKSPACES IN ACCOUNT")
+	if err != nil {
+		logger.ErrorContext(context.Background(), "query SHOW WORKSPACES failed", "error", err)
+		return nil, fmt.Errorf("error querying SHOW WORKSPACES: %w", err)
+	}
+	defer rows.Close()
+
+	cols, err := rows.Columns()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get columns for SHOW WORKSPACES: %w", err)
+	}
+	nameIdx, dbIdx, schemaIdx := -1, -1, -1
+	for i, col := range cols {
+		switch strings.ToLower(col) {
+		case "name":
+			nameIdx = i
+		case "database_name":
+			dbIdx = i
+		case "schema_name":
+			schemaIdx = i
+		}
+	}
+	if nameIdx < 0 || dbIdx < 0 || schemaIdx < 0 {
+		return nil, errors.New("name, database_name or schema_name column not found in SHOW WORKSPACES result")
+	}
+
+	raw := make([]sql.NullString, len(cols))
+	vals := make([]any, len(cols))
+	for i := range raw {
+		vals[i] = &raw[i]
+	}
+
+	workspaces := make(map[string]struct{})
+	for rows.Next() {
+		if err := rows.Scan(vals...); err != nil {
+			logger.ErrorContext(context.Background(), "scanning SHOW WORKSPACES row failed", "error", err)
+			return nil, fmt.Errorf("error scanning SHOW WORKSPACES: %w", err)
+		}
+		if raw[nameIdx].Valid && raw[dbIdx].Valid && raw[schemaIdx].Valid {
+			fqn := fmt.Sprintf("%s.%s.%s", raw[dbIdx].String, raw[schemaIdx].String, raw[nameIdx].String)
+			workspaces[normalizeObjectName(fqn)] = struct{}{}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iteration error on SHOW WORKSPACES: %w", err)
+	}
+	return workspaces, nil
+}
+
 // RoleProcessor encapsulates dependencies and configuration for processing roles.
 type RoleProcessor struct {
 	db                 *sql.DB
@@ -292,6 +352,7 @@ type RoleProcessor struct {
 	existingRoles      map[string]struct{}
 	existingUsers      map[string]string
 	existingWarehouses map[string]string
+	existingWorkspaces map[string]struct{} // normalized DB.SCHEMA.NAME keys
 
 	qRole       string
 	qUser       string
@@ -326,6 +387,7 @@ func (rp *RoleProcessor) Init() error {
 		rp.logger.WarnContext(context.Background(), "Dry run enabled with nil DB — skipping role/user fetch")
 		rp.existingRoles = make(map[string]struct{})
 		rp.existingUsers = make(map[string]string)
+		rp.existingWorkspaces = make(map[string]struct{})
 		return nil
 	}
 	var err error
@@ -343,6 +405,13 @@ func (rp *RoleProcessor) Init() error {
 	if err != nil {
 		rp.logger.ErrorContext(context.Background(), "Failed to fetch warehouses from Snowflake", "error", err)
 		return err
+	}
+	// Workspaces are a newer Snowflake feature; a failure here (e.g. feature unavailable) must not
+	// abort syncs that don't use workspaces. Degrade to an empty set and warn.
+	rp.existingWorkspaces, err = FetchShowWorkspaces(rp.db)
+	if err != nil {
+		rp.logger.WarnContext(context.Background(), "Failed to fetch workspaces from Snowflake; continuing without workspace existence cache", "error", err)
+		rp.existingWorkspaces = make(map[string]struct{})
 	}
 	return nil
 }
@@ -446,7 +515,8 @@ type GrantKey struct {
 	ObjectName string // e.g. MYDB, MYDB.PUBLIC, MYDB.PUBLIC.MYTABLE
 }
 
-// normalizeObjectName strips quotes and uppercases all parts for consistent diffing
+// normalizeObjectName strips quotes and uppercases all parts for consistent diffing.
+// Uppercasing matches Snowflake, which folds unquoted identifiers to uppercase by default.
 func normalizeObjectName(objectName string) string {
 	parts := strings.Split(objectName, ".")
 	for i, part := range parts {
@@ -500,10 +570,51 @@ func (rp *RoleProcessor) execQuery(query string) error {
 	return err
 }
 
+// createWorkspaceIfNotExists creates a workspace (DB.SCHEMA.NAME) when it is not present in the
+// cached existence set. It uses the non-destructive `CREATE WORKSPACE` form (never `CREATE OR
+// REPLACE`, which would wipe an existing workspace's files) and treats an "already exists" error as
+// benign — a safeguard for the case where SHOW WORKSPACES omitted a workspace the running role
+// lacks privileges on.
+func (rp *RoleProcessor) createWorkspaceIfNotExists(name string) error {
+	key := normalizeObjectName(name)
+	if _, exists := rp.existingWorkspaces[key]; exists {
+		return nil
+	}
+	rp.logger.WarnContext(context.Background(), "Workspace not found; creating", "workspace", name, "role", rp.roleName)
+	// Build the statement from the normalized (uppercased) key so CREATE WORKSPACE and the later
+	// GRANT (which uses the normalized name) reference the exact same case-sensitive identifier.
+	//nolint:gosec // G202: object name is safely quoted by quoteObjectName
+	createQuery := "CREATE WORKSPACE " + quoteObjectName(key)
+	if err := rp.execQuery(createQuery); err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "already exists") {
+			rp.logger.InfoContext(context.Background(), "Workspace already exists", "workspace", name)
+			rp.existingWorkspaces[key] = struct{}{}
+			return nil
+		}
+		return fmt.Errorf("failed to create workspace %s: %w", name, err)
+	}
+	rp.existingWorkspaces[key] = struct{}{}
+	return nil
+}
+
 // Rename permissionProcess to applySpecialGrants for clarity
 func (rp *RoleProcessor) applySpecialGrants(role Role) error {
 	if role.Permissions == nil {
 		return nil
+	}
+
+	// Workspaces: create any referenced workspace that does not yet exist, before granting on it.
+	// A create failure (e.g. missing CREATE WORKSPACE privilege, feature disabled) is non-fatal —
+	// warn and continue so one un-creatable workspace can't abort the whole multi-role sync. The
+	// subsequent GRANT will simply warn-fail too, consistent with how grant errors are handled.
+	for _, ws := range role.Permissions.Workspaces {
+		if ws.Remove {
+			continue
+		}
+		if err := rp.createWorkspaceIfNotExists(ws.Name); err != nil {
+			rp.logger.WarnContext(context.Background(), "Failed to create workspace; skipping", "workspace", ws.Name, "role", rp.roleName, "error", err)
+			continue
+		}
 	}
 
 	// Helper to grant USAGE on all schemas in a database
@@ -949,7 +1060,35 @@ func ValidateRolesConfig(rc *RolesConfig) error {
 				return fmt.Errorf("member in role '%s' has empty email", role.Name)
 			}
 		}
-		// TODO Optionally validate permissions structure here if needed
+		// Syntactic permission checks that need no DB connection are done here so the `validate`
+		// command catches them and a bad config is rejected before any grants are applied.
+		if role.Permissions != nil {
+			for _, ws := range role.Permissions.Workspaces {
+				// Use unlimited Split (not SplitN) and require EXACTLY three parts: a name with a
+				// dot in any component (e.g. "DB.PUBLIC.MY.WS") is rejected rather than silently
+				// shredded into extra quoted identifier parts by the downstream normalize/quote path.
+				parts := strings.Split(ws.Name, ".")
+				if len(parts) != 3 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" || strings.TrimSpace(parts[2]) == "" {
+					return fmt.Errorf("role '%s': workspace permission name must be in format DATABASE.SCHEMA.WORKSPACE_NAME (exactly three dot-separated parts), got: %q", role.Name, ws.Name)
+				}
+				for _, priv := range ws.Grants {
+					switch strings.ToUpper(strings.TrimSpace(priv)) {
+					case "READ", "WRITE":
+						// valid
+					default:
+						return fmt.Errorf("role '%s': workspace %q has unsupported privilege %q (only READ and WRITE are grantable on a workspace)", role.Name, ws.Name, priv)
+					}
+				}
+			}
+			// Account privileges are an open-ended set, so we can't whitelist them — but an empty or
+			// blank entry produces a malformed `GRANT  ON ACCOUNT ...` whose error is only warn-logged
+			// at sync time, so reject it up front.
+			for _, priv := range role.Permissions.AccountPrivileges {
+				if strings.TrimSpace(priv) == "" {
+					return fmt.Errorf("role '%s': account_privileges contains an empty privilege", role.Name)
+				}
+			}
+		}
 	}
 	return nil
 }
@@ -994,16 +1133,11 @@ func (rp *RoleProcessor) ValidateConfigObjects(role Role) error {
 			}
 		}
 	}
-	// Workspaces: validate name is a 3-part identifier (DATABASE.SCHEMA.WORKSPACE)
-	for _, ws := range role.Permissions.Workspaces {
-		parts := strings.SplitN(ws.Name, ".", 3)
-		if len(parts) != 3 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" || strings.TrimSpace(parts[2]) == "" {
-			errs = append(errs, fmt.Errorf("workspace permission name must be in format DATABASE.SCHEMA.WORKSPACE_NAME, got: %q", ws.Name))
-		}
-	}
+	// Workspace name/privilege validation is handled up-front in ValidateRolesConfig (no DB needed),
+	// so a bad config is rejected before any grants are applied.
 
 	if len(errs) > 0 {
-		return errors.New("configuration validation errors")
+		return fmt.Errorf("configuration validation errors: %w", errors.Join(errs...))
 	}
 	return nil
 }
@@ -1207,6 +1341,12 @@ func (rp *RoleProcessor) buildDesiredGrantsFromConfig(role Role) map[GrantKey]st
 		}
 	}
 
+	// Account-level privileges (no object name)
+	for _, priv := range role.Permissions.AccountPrivileges {
+		gk := GrantKey{Privilege: strings.ToUpper(strings.TrimSpace(priv)), ObjectType: "ACCOUNT", ObjectName: ""}
+		grants[gk] = struct{}{}
+	}
+
 	// Add warehouse usage grant as part of desired grants because it is a default requirement
 	warehouseName := rp.roleName + "_WAREHOUSE"
 	gk := GrantKey{
@@ -1228,7 +1368,13 @@ func (rp *RoleProcessor) fetchCurrentGrants() map[GrantKey]struct{} {
 		return result
 	}
 	for _, g := range grantRows {
-		gk := GrantKey{Privilege: strings.ToUpper(g.Privilege), ObjectType: strings.ToUpper(g.GrantedOn), ObjectName: normalizeObjectName(g.Name)}
+		// Account-level grants report a non-empty Name (the account locator), but desired
+		// account grants carry an empty ObjectName. Normalize so the diff lines up.
+		objName := normalizeObjectName(g.Name)
+		if strings.EqualFold(g.GrantedOn, "ACCOUNT") {
+			objName = ""
+		}
+		gk := GrantKey{Privilege: strings.ToUpper(g.Privilege), ObjectType: strings.ToUpper(g.GrantedOn), ObjectName: objName}
 		result[gk] = struct{}{}
 	}
 	return result
@@ -1236,24 +1382,37 @@ func (rp *RoleProcessor) fetchCurrentGrants() map[GrantKey]struct{} {
 
 // Build GRANT statement from GrantKey
 func (rp *RoleProcessor) buildGrantStatement(g GrantKey) string {
+	// Account-level privileges have no object name: GRANT <priv> ON ACCOUNT TO ROLE <role>
+	if g.ObjectType == "ACCOUNT" {
+		return fmt.Sprintf("GRANT %s ON ACCOUNT TO ROLE %s", g.Privilege, rp.qRole)
+	}
 	return fmt.Sprintf("GRANT %s ON %s %s TO ROLE %s", g.Privilege, g.ObjectType, quoteObjectName(g.ObjectName), rp.qRole)
 }
 
 // Build REVOKE statement from GrantKey
 func (rp *RoleProcessor) buildRevokeQuery(g GrantKey) string {
+	// Account-level privileges have no object name: REVOKE <priv> ON ACCOUNT FROM ROLE <role>
+	if g.ObjectType == "ACCOUNT" {
+		return fmt.Sprintf("REVOKE %s ON ACCOUNT FROM ROLE %s", g.Privilege, rp.qRole)
+	}
 	return fmt.Sprintf("REVOKE %s ON %s %s FROM ROLE %s", g.Privilege, g.ObjectType, quoteObjectName(g.ObjectName), rp.qRole)
 }
 
 // Main sync logic
 func (rp *RoleProcessor) syncRoleGrants(role Role) {
-	// If no permissions in config, skip all revokes
-	if (role.Name == "ACCOUNTADMIN" || role.Name == "ORGADMIN" ||
-		role.Name == "SYSADMIN" || role.Name == "SECURITYADMIN" || role.Name == "USERADMIN") ||
+	// If no permissions in config, skip all revokes. Compare against the uppercased name so a
+	// mixed/lower-case spelling of a system role (e.g. "sysadmin") cannot slip past this guard and
+	// have its grants — including account-level privileges — revoked.
+	upperName := strings.ToUpper(role.Name)
+	if (upperName == "ACCOUNTADMIN" || upperName == "ORGADMIN" ||
+		upperName == "SYSADMIN" || upperName == "SECURITYADMIN" || upperName == "USERADMIN" ||
+		upperName == "PUBLIC") ||
 		role.Permissions == nil || (len(role.Permissions.Databases) == 0 &&
 		len(role.Permissions.Schemas) == 0 &&
 		len(role.Permissions.Tables) == 0 &&
 		len(role.Permissions.Views) == 0 &&
-		len(role.Permissions.Workspaces) == 0) {
+		len(role.Permissions.Workspaces) == 0 &&
+		len(role.Permissions.AccountPrivileges) == 0) {
 		return
 	}
 
@@ -1271,6 +1430,7 @@ func (rp *RoleProcessor) syncRoleGrants(role Role) {
 		"VIEW":      {},
 		"WAREHOUSE": {},
 		"WORKSPACE": {},
+		"ACCOUNT":   {},
 	}
 	filteredToRevoke := make(map[GrantKey]struct{})
 	for gk := range toRevoke {
