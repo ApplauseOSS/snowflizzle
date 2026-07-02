@@ -23,6 +23,7 @@ import (
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/applauseoss/snowflizzle/internal/logging"
 )
 
 func TestValidateRolesFile(t *testing.T) {
@@ -306,6 +307,151 @@ func TestPatternMatches(t *testing.T) {
 	}
 }
 
+func TestBuildAccountGrantStatements(t *testing.T) {
+	rp := &RoleProcessor{qRole: quoteIdentifier("DATASCIENCE_ROLE")}
+	gk := GrantKey{Privilege: "EXECUTE TASK", ObjectType: "ACCOUNT", ObjectName: ""}
+
+	if got, want := rp.buildGrantStatement(gk), `GRANT EXECUTE TASK ON ACCOUNT TO ROLE "DATASCIENCE_ROLE"`; got != want {
+		t.Errorf("buildGrantStatement(ACCOUNT) = %q; want %q", got, want)
+	}
+	if got, want := rp.buildRevokeQuery(gk), `REVOKE EXECUTE TASK ON ACCOUNT FROM ROLE "DATASCIENCE_ROLE"`; got != want {
+		t.Errorf("buildRevokeQuery(ACCOUNT) = %q; want %q", got, want)
+	}
+
+	// Non-account grants must still include the quoted object name.
+	wsKey := GrantKey{Privilege: "WRITE", ObjectType: "WORKSPACE", ObjectName: "DB.PUBLIC.WS"}
+	if got, want := rp.buildGrantStatement(wsKey), `GRANT WRITE ON WORKSPACE "DB"."PUBLIC"."WS" TO ROLE "DATASCIENCE_ROLE"`; got != want {
+		t.Errorf("buildGrantStatement(WORKSPACE) = %q; want %q", got, want)
+	}
+}
+
+func TestFetchShowWorkspaces(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("error creating sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	columns := []string{"created_on", "name", "database_name", "schema_name", "owner"}
+	rows := sqlmock.NewRows(columns).
+		AddRow("2025-01-01", "MY_WORKSPACE", "MYDB", "PUBLIC", "SYSADMIN").
+		AddRow("2025-01-02", "SALESOPS WORKSPACE", "BI_REFINING_DATABASE_PROD", "SALESFORCE", "SYSADMIN").
+		AddRow("2025-01-03", "my_workspace", "mydb", "work", "SYSADMIN") // unquoted-lowercase folds to uppercase
+
+	mock.ExpectQuery(`SHOW WORKSPACES IN ACCOUNT`).WillReturnRows(rows)
+
+	got, err := FetchShowWorkspaces(db)
+	if err != nil {
+		t.Fatalf("FetchShowWorkspaces returned error: %v", err)
+	}
+	want := map[string]struct{}{
+		"MYDB.PUBLIC.MY_WORKSPACE":                                {},
+		"BI_REFINING_DATABASE_PROD.SALESFORCE.SALESOPS WORKSPACE": {},
+		"MYDB.WORK.MY_WORKSPACE":                                  {}, // normalized to uppercase
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got workspaces %v; want %v", got, want)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unfulfilled expectations: %v", err)
+	}
+}
+
+func TestValidateWorkspacePrivileges(t *testing.T) {
+	tests := []struct {
+		name          string
+		grants        []string
+		wsName        string
+		expectedError bool
+		errorContains string
+	}{
+		{name: "read_write_ok", grants: []string{"READ", "WRITE"}, wsName: "DB.PUBLIC.WS", expectedError: false},
+		{name: "usage_rejected", grants: []string{"USAGE", "READ"}, wsName: "DB.PUBLIC.WS", expectedError: true, errorContains: "unsupported privilege"},
+		{name: "bad_name", grants: []string{"READ"}, wsName: "DB.WS", expectedError: true, errorContains: "DATABASE.SCHEMA.WORKSPACE_NAME"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Workspace privilege/name validation is up-front in ValidateRolesConfig (no DB needed).
+			rc := &RolesConfig{Roles: []Role{{
+				Name:    "TESTROLE",
+				Members: []RoleMember{{Email: "user@example.com"}},
+				Permissions: &RolePermissions{
+					Workspaces: []WorkspacePermission{{Name: tc.wsName, Grants: tc.grants}},
+				},
+			}}}
+			err := ValidateRolesConfig(rc)
+			if tc.expectedError {
+				if err == nil {
+					t.Fatalf("expected error but got nil")
+				}
+				if tc.errorContains != "" && !strings.Contains(err.Error(), tc.errorContains) {
+					t.Errorf("error %q does not contain %q", err.Error(), tc.errorContains)
+				}
+			} else if err != nil {
+				t.Errorf("expected no error but got: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateAccountPrivilegesRejectsEmpty(t *testing.T) {
+	rc := &RolesConfig{Roles: []Role{{
+		Name:    "TESTROLE",
+		Members: []RoleMember{{Email: "user@example.com"}},
+		Permissions: &RolePermissions{
+			AccountPrivileges: []string{"EXECUTE TASK", "  "},
+		},
+	}}}
+	err := ValidateRolesConfig(rc)
+	if err == nil {
+		t.Fatalf("expected error for blank account privilege, got nil")
+	}
+	if !strings.Contains(err.Error(), "empty privilege") {
+		t.Errorf("error %q does not mention empty privilege", err.Error())
+	}
+}
+
+// TestFetchCurrentGrantsAccountNormalization locks the load-bearing contract for account_privileges:
+// SHOW GRANTS TO ROLE reports account-level grants with granted_on=ACCOUNT and a NON-EMPTY name (the
+// account locator). fetchCurrentGrants must collapse that name to "" so the current grant matches the
+// desired key (ObjectName:"") and the diff is empty — i.e. the sync is idempotent and does NOT churn.
+//
+// NOTE: confirmed against real Snowflake output — `SHOW GRANTS TO ROLE` reports granted_on=ACCOUNT
+// for EXECUTE TASK and EXECUTE ALERT.
+func TestFetchCurrentGrantsAccountNormalization(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("error creating sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	columns := []string{"privilege", "granted_on", "name", "granted_to", "grantee_name"}
+	rows := sqlmock.NewRows(columns).
+		AddRow("EXECUTE TASK", "ACCOUNT", "MYORG.MYACCOUNT", "ROLE", "X").
+		AddRow("USAGE", "WAREHOUSE", "X_WAREHOUSE", "ROLE", "X")
+	mock.ExpectQuery(`SHOW GRANTS TO ROLE`).WillReturnRows(rows)
+
+	rp := &RoleProcessor{db: db, logger: logging.GetLogger(), roleName: "X"}
+	current := rp.fetchCurrentGrants()
+
+	accountKey := GrantKey{Privilege: "EXECUTE TASK", ObjectType: "ACCOUNT", ObjectName: ""}
+	if _, ok := current[accountKey]; !ok {
+		t.Fatalf("account grant not normalized to empty ObjectName; current = %v", current)
+	}
+
+	// Idempotency: a desired set built from account_privileges:[EXECUTE TASK] must produce no diff
+	// against the normalized current grant.
+	desired := map[GrantKey]struct{}{accountKey: {}}
+	if d := difference(desired, current); len(d) != 0 {
+		t.Errorf("expected no grants to add (idempotent), got %v", d)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unfulfilled expectations: %v", err)
+	}
+}
+
 func TestYAMLParsingAndValidation(t *testing.T) {
 	const validYAML = `
 roles:
@@ -322,6 +468,12 @@ roles:
       tables:
         - name: MYDB.PUBLIC.MYTABLE
           grants: [SELECT]
+      workspaces:
+        - name: MYDB.PUBLIC.MY_WORKSPACE
+          grants: [READ, WRITE]
+      account_privileges:
+        - EXECUTE TASK
+        - EXECUTE ALERT
 `
 	tmpDir := t.TempDir()
 	tmpFile := filepath.Join(tmpDir, "roles.yaml")
@@ -337,6 +489,16 @@ roles:
 	}
 	if err := ValidateRolesConfig(rc); err != nil {
 		t.Errorf("ValidateRolesConfig failed: %v", err)
+	}
+	perms := rc.Roles[0].Permissions
+	if perms == nil {
+		t.Fatalf("Expected permissions to be parsed, got nil")
+	}
+	if len(perms.Workspaces) != 1 || perms.Workspaces[0].Name != "MYDB.PUBLIC.MY_WORKSPACE" {
+		t.Errorf("Workspaces not parsed correctly: %+v", perms.Workspaces)
+	}
+	if want := []string{"EXECUTE TASK", "EXECUTE ALERT"}; !reflect.DeepEqual(perms.AccountPrivileges, want) {
+		t.Errorf("AccountPrivileges = %v; want %v", perms.AccountPrivileges, want)
 	}
 
 	// Invalid YAML
