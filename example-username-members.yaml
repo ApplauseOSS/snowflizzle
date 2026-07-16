@@ -1,0 +1,22 @@
+roles:
+  - name: DEMO_EMAIL_MEMBER
+    members:
+      - email: alice@example.com
+    permissions:
+      account_privileges:
+        - EXECUTE TASK
+
+  - name: DEMO_USERNAME_MEMBER
+    members:
+      - username: svc_snowflizzle
+    permissions:
+      account_privileges:
+        - EXECUTE TASK
+
+  - name: DEMO_MIXED_MEMBERS
+    members:
+      - email: bob@example.com
+      - username: svc_reporter
+    permissions:
+      account_privileges:
+        - EXECUTE TASK
