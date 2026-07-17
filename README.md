@@ -20,7 +20,8 @@ roles:
     members:
       - email: exemployee1@example.com
       - email: exemployee2@example.com
-        removed: true
+        remove: true
+      - username: svc_account  # login_name without '@' (alternative to email)
     permissions:
       # Option for names
       # - database_name
@@ -61,6 +62,28 @@ roles:
             - READ
             - WRITE
 ```
+
+### Role members
+
+Members are matched against the Snowflake `LOGIN_NAME` column via one of two mutually-exclusive fields — `email` or `username`. Exactly one must be provided per member. The tool resolves the matched user's `NAME` and uses it in the `GRANT ROLE ... TO USER` statement.
+
+| Field | Description |
+| ----- | ----------- |
+| `email` | A `LOGIN_NAME` containing `@` (e.g. `user@example.com`). Matched case-insensitively. |
+| `username` | A `LOGIN_NAME` without `@` (e.g. a service account like `svc_account`). Matched case-insensitively. |
+| `remove` | Optional. If `true`, revokes the role from this user. Defaults to `false` (grant the role). |
+
+Example mixing email and username:
+
+```yaml
+members:
+  - email: user@example.com
+  - username: svc_account
+  - email: departed_user@example.com
+    remove: true
+```
+
+For more examples, see [`example-username-members.yaml`](example-username-members.yaml).
 
 ### Workspace grants
 

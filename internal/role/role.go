@@ -37,11 +37,14 @@ var systemRoles = map[string]struct{}{
 	"SYSADMIN":      {},
 }
 
-// RoleMember represents a member of a role, identified by their email address.
+// RoleMember represents a member of a role, identified by either email or username (mutually exclusive).
+// Both match against the Snowflake LOGIN_NAME column: `email` is a login_name containing '@',
+// `username` is a login_name without one. The resolved user's NAME is used in the GRANT statement.
 // The Remove field indicates whether the member has to be removed from the role.
 type RoleMember struct {
-	Email  string `yaml:"email"`
-	Remove bool   `yaml:"remove,omitempty"`
+	Email    string `yaml:"email,omitempty"`
+	Username string `yaml:"username,omitempty"`
+	Remove   bool   `yaml:"remove,omitempty"`
 }
 
 // DatabasePermission represents a database permission entry.
@@ -186,7 +189,9 @@ func FetchShowRoles(db *sql.DB) (map[string]struct{}, error) {
 	return roles, nil
 }
 
-// FetchShowUsers returns a map from login_name to NAME from SHOW USERS.
+// FetchShowUsers returns a map from LOGIN_NAME (uppercased) to the user's NAME.
+// Members are matched by LOGIN_NAME (via the `email` or `username` config field),
+// but GRANT ROLE ... TO USER requires the user's NAME identifier — hence the value.
 func FetchShowUsers(db *sql.DB) (map[string]string, error) {
 	logger := logging.GetLogger()
 	ctx := context.Background()
@@ -231,6 +236,7 @@ func FetchShowUsers(db *sql.DB) (map[string]string, error) {
 		login := raw[loginIdx]
 		name := raw[nameIdx]
 		if login.Valid && name.Valid {
+			// Key on LOGIN_NAME (what config matches on); value is NAME (what GRANT needs).
 			users[strings.ToUpper(login.String)] = name.String
 		}
 	}
@@ -350,7 +356,7 @@ type RoleProcessor struct {
 	dryRun             bool
 	logger             *slog.Logger
 	existingRoles      map[string]struct{}
-	existingUsers      map[string]string
+	existingUsers      map[string]string // login_name (uppercased) -> NAME
 	existingWarehouses map[string]string
 	existingWorkspaces map[string]struct{} // normalized DB.SCHEMA.NAME keys
 
@@ -530,19 +536,24 @@ func normalizeObjectName(objectName string) string {
 // It returns the number of users skipped because they do not exist in rp.existingUsers, and an error if any operation fails.
 func (rp *RoleProcessor) memberProcess(role Role) (usersSkipped int, err error) {
 	for _, member := range role.Members {
+		ident := member.Email
+		if trimmedUsername := strings.TrimSpace(member.Username); trimmedUsername != "" {
+			ident = trimmedUsername
+		}
+
 		if len(rp.existingUsers) > 0 {
-			upperMemberKey := strings.ToUpper(member.Email)
-			memberName, ok := rp.existingUsers[upperMemberKey]
+			upperKey := strings.ToUpper(ident)
+			memberName, ok := rp.existingUsers[upperKey]
 			if !ok {
 				usersSkipped++
-				rp.logger.WarnContext(context.Background(), "Skipping non-existent member", "member", member.Email)
+				rp.logger.WarnContext(context.Background(), "Skipping non-existent member", "member", ident)
 				continue
 			}
 			rp.qUser = quoteIdentifier(memberName)
 			rp.displayUser = memberName
 		} else {
-			rp.qUser = quoteIdentifier(member.Email)
-			rp.displayUser = member.Email
+			rp.qUser = quoteIdentifier(ident)
+			rp.displayUser = ident
 		}
 
 		if member.Remove {
@@ -1056,8 +1067,13 @@ func ValidateRolesConfig(rc *RolesConfig) error {
 			return fmt.Errorf("role '%s' must have at least one member", role.Name)
 		}
 		for _, m := range role.Members {
-			if strings.TrimSpace(m.Email) == "" {
-				return fmt.Errorf("member in role '%s' has empty email", role.Name)
+			hasEmail := strings.TrimSpace(m.Email) != ""
+			hasUsername := strings.TrimSpace(m.Username) != ""
+			switch {
+			case !hasEmail && !hasUsername:
+				return fmt.Errorf("member in role '%s' has neither email nor username", role.Name)
+			case hasEmail && hasUsername:
+				return fmt.Errorf("member in role '%s' has both email and username set; specify only one", role.Name)
 			}
 		}
 		// Syntactic permission checks that need no DB connection are done here so the `validate`

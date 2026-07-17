@@ -72,14 +72,35 @@ func TestValidateRolesFile(t *testing.T) {
 			errorContains: "must have at least one member",
 		},
 		{
-			name: "role_with_empty_user",
+			name: "role_with_empty_identifier",
 			content: `roles:
   - name: ANALYST
     members:
       - email: ""
+        username: ""
 `,
 			expectedError: true,
-			errorContains: "member in role 'ANALYST' has empty email",
+			errorContains: "member in role 'ANALYST' has neither email nor username",
+		},
+		{
+			name: "valid_username_only",
+			content: `roles:
+  - name: ANALYST
+    members:
+      - username: svc_user
+`,
+			expectedError: false,
+		},
+		{
+			name: "invalid_both_email_and_username",
+			content: `roles:
+  - name: ANALYST
+    members:
+      - email: user@example.com
+        username: svc_user
+`,
+			expectedError: true,
+			errorContains: "member in role 'ANALYST' has both email and username set",
 		},
 		{
 			name: "invalid_yaml",
@@ -197,6 +218,7 @@ func TestFetchShowUsers(t *testing.T) {
 		t.Fatalf("FetchShowUsers returned error: %v", err)
 	}
 
+	// Map keys on LOGIN_NAME (uppercased); values are the user's NAME (used in GRANT).
 	want := map[string]string{
 		"JOHN@EXAMPLE.COM":   "john",
 		"SANDRA@EXAMPLE.COM": "sandra",
@@ -204,6 +226,7 @@ func TestFetchShowUsers(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("got users %v; want %v", got, want)
 	}
+
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unfulfilled expectations: %v", err)
 	}
