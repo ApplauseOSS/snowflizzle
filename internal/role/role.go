@@ -663,12 +663,12 @@ func (rp *RoleProcessor) applySpecialGrants(role Role) error {
 
 	// Tables: handle USAGE on all schemas and future grants
 	for _, tbl := range role.Permissions.Tables {
-		nameParts := strings.SplitN(tbl.Name, ".", 3)
+		nameParts := strings.SplitN(normalizeObjectName(tbl.Name), ".", 3)
 		if len(nameParts) < 3 {
 			rp.logger.WarnContext(context.Background(), "Table permission name must be in format DATABASE.SCHEMA.TABLE, DATABASE.SCHEMA.*, DATABASE.*.*", "name", tbl.Name)
 			continue
 		}
-		dbName, schemaPattern, tablePattern := strings.ToUpper(nameParts[0]), nameParts[1], nameParts[2]
+		dbName, schemaPattern, tablePattern := nameParts[0], nameParts[1], nameParts[2]
 
 		if schemaPattern == "*" && tablePattern == "*" {
 			if err := grantUsageOnAllSchemas(dbName); err != nil {
@@ -702,12 +702,12 @@ func (rp *RoleProcessor) applySpecialGrants(role Role) error {
 
 	// Views: handle USAGE on all schemas and future grants
 	for _, vw := range role.Permissions.Views {
-		nameParts := strings.SplitN(vw.Name, ".", 3)
+		nameParts := strings.SplitN(normalizeObjectName(vw.Name), ".", 3)
 		if len(nameParts) < 3 {
 			rp.logger.WarnContext(context.Background(), "View permission name must be in format DATABASE.SCHEMA.VIEW, DATABASE.SCHEMA.*, DATABASE.*.*", "name", vw.Name)
 			continue
 		}
-		dbName, schemaPattern, viewPattern := strings.ToUpper(nameParts[0]), nameParts[1], nameParts[2]
+		dbName, schemaPattern, viewPattern := nameParts[0], nameParts[1], nameParts[2]
 
 		if schemaPattern == "*" && viewPattern == "*" {
 			if err := grantUsageOnAllSchemas(dbName); err != nil {
@@ -784,9 +784,9 @@ func (rp *RoleProcessor) applySpecialGrants(role Role) error {
 	dbSchemaFutureViews := make(map[string]struct{})
 	dbSchemaFutureDynamicTables := make(map[string]struct{})
 	for _, tbl := range role.Permissions.Tables {
-		nameParts := strings.SplitN(tbl.Name, ".", 3)
+		nameParts := strings.SplitN(normalizeObjectName(tbl.Name), ".", 3)
 		if len(nameParts) == 3 {
-			db, schema, table := strings.ToUpper(nameParts[0]), nameParts[1], nameParts[2]
+			db, schema, table := nameParts[0], nameParts[1], nameParts[2]
 			if table == "*" {
 				key := db + "." + schema
 				dbSchemaFutureTables[key] = struct{}{}
@@ -794,9 +794,9 @@ func (rp *RoleProcessor) applySpecialGrants(role Role) error {
 		}
 	}
 	for _, vw := range role.Permissions.Views {
-		nameParts := strings.SplitN(vw.Name, ".", 3)
+		nameParts := strings.SplitN(normalizeObjectName(vw.Name), ".", 3)
 		if len(nameParts) == 3 {
-			db, schema, view := strings.ToUpper(nameParts[0]), nameParts[1], nameParts[2]
+			db, schema, view := nameParts[0], nameParts[1], nameParts[2]
 			if view == "*" {
 				key := db + "." + schema
 				dbSchemaFutureViews[key] = struct{}{}
@@ -818,17 +818,15 @@ func (rp *RoleProcessor) applySpecialGrants(role Role) error {
 	current := rp.fetchCurrentGrants()
 	dbSet := make(map[string]struct{})
 	for _, tbl := range role.Permissions.Tables {
-		nameParts := strings.SplitN(tbl.Name, ".", 3)
+		nameParts := strings.SplitN(normalizeObjectName(tbl.Name), ".", 3)
 		if len(nameParts) == 3 {
-			db := strings.ToUpper(nameParts[0])
-			dbSet[db] = struct{}{}
+			dbSet[nameParts[0]] = struct{}{}
 		}
 	}
 	for _, vw := range role.Permissions.Views {
-		nameParts := strings.SplitN(vw.Name, ".", 3)
+		nameParts := strings.SplitN(normalizeObjectName(vw.Name), ".", 3)
 		if len(nameParts) == 3 {
-			db := strings.ToUpper(nameParts[0])
-			dbSet[db] = struct{}{}
+			dbSet[nameParts[0]] = struct{}{}
 		}
 	}
 	for _, dt := range role.Permissions.DynamicTables {
@@ -881,11 +879,13 @@ func (rp *RoleProcessor) applySpecialGrants(role Role) error {
 					}
 				}
 			}
-			// FUTURE_DYNAMIC_TABLE
+			// FUTURE_DYNAMIC_TABLE — unlike FUTURE_TABLE/FUTURE_VIEW above, this one is built with
+			// the correct schema-level REVOKE syntax rather than buildRevokeQuery's generic
+			// "ON <type> <name>" form, which isn't valid Snowflake syntax for a future grant.
 			if _, want := dbSchemaFutureDynamicTables[key]; !want {
 				for gk := range current {
 					if gk.ObjectType == "FUTURE_DYNAMIC_TABLE" && gk.ObjectName == key {
-						query := rp.buildRevokeQuery(gk)
+						query := fmt.Sprintf("REVOKE %s ON FUTURE DYNAMIC TABLES IN SCHEMA %s FROM ROLE %s", gk.Privilege, quoteObjectName(key), rp.qRole)
 						err := rp.execQuery(query)
 						if err != nil {
 							rp.logger.WarnContext(context.Background(), "Explicitly revoked future dynamic table grant", "query", query, "error", err)
@@ -1420,11 +1420,11 @@ func (rp *RoleProcessor) buildDesiredGrantsFromConfig(role Role) map[GrantKey]st
 
 	// Tables (expand wildcards to all real tables)
 	for _, tbl := range role.Permissions.Tables {
-		nameParts := strings.SplitN(tbl.Name, ".", 3)
+		nameParts := strings.SplitN(normalizeObjectName(tbl.Name), ".", 3)
 		if len(nameParts) < 3 {
 			continue
 		}
-		dbName, schemaPattern, tablePattern := strings.ToUpper(nameParts[0]), nameParts[1], nameParts[2]
+		dbName, schemaPattern, tablePattern := nameParts[0], nameParts[1], nameParts[2]
 		var tablesBySchema map[string][]string
 		var ok bool
 		if tablesBySchema, ok = tablesCache[dbName]; !ok {
@@ -1453,11 +1453,11 @@ func (rp *RoleProcessor) buildDesiredGrantsFromConfig(role Role) map[GrantKey]st
 	}
 	// Views (expand wildcards to all real views)
 	for _, vw := range role.Permissions.Views {
-		nameParts := strings.SplitN(vw.Name, ".", 3)
+		nameParts := strings.SplitN(normalizeObjectName(vw.Name), ".", 3)
 		if len(nameParts) < 3 {
 			continue
 		}
-		dbName, schemaPattern, viewPattern := strings.ToUpper(nameParts[0]), nameParts[1], nameParts[2]
+		dbName, schemaPattern, viewPattern := nameParts[0], nameParts[1], nameParts[2]
 		var viewsBySchema map[string][]string
 		var ok bool
 		if viewsBySchema, ok = viewsCache[dbName]; !ok {
