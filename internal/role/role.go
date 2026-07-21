@@ -79,6 +79,14 @@ type ViewPermission struct {
 	Remove bool     `yaml:"remove,omitempty"`
 }
 
+// DynamicTablePermission represents a dynamic table permission entry.
+// Example: { name: "MYDB.PUBLIC.MYDYNAMICTABLE", grants: ["SELECT"] }
+type DynamicTablePermission struct {
+	Name   string   `yaml:"name"`
+	Grants []string `yaml:"grants,omitempty"`
+	Remove bool     `yaml:"remove,omitempty"`
+}
+
 // WorkspacePermission represents a Snowflake workspace permission entry.
 // Only READ and WRITE are grantable on a workspace (WRITE implies READ).
 // Example: { name: "MYDB.MYSCHEMA.MY WORKSPACE", grants: ["READ", "WRITE"] }
@@ -91,11 +99,12 @@ type WorkspacePermission struct {
 // RolePermissions represents permissions for a role, including databases, schemas, tables, views,
 // workspaces, and account-level privileges.
 type RolePermissions struct {
-	Databases  []DatabasePermission  `yaml:"databases,omitempty"`
-	Schemas    []SchemaPermission    `yaml:"schemas,omitempty"`
-	Tables     []TablePermission     `yaml:"tables,omitempty"`
-	Views      []ViewPermission      `yaml:"views,omitempty"`
-	Workspaces []WorkspacePermission `yaml:"workspaces,omitempty"`
+	Databases     []DatabasePermission     `yaml:"databases,omitempty"`
+	Schemas       []SchemaPermission       `yaml:"schemas,omitempty"`
+	Tables        []TablePermission        `yaml:"tables,omitempty"`
+	Views         []ViewPermission         `yaml:"views,omitempty"`
+	DynamicTables []DynamicTablePermission `yaml:"dynamic_tables,omitempty"`
+	Workspaces    []WorkspacePermission    `yaml:"workspaces,omitempty"`
 	// AccountPrivileges are account-scoped privileges granted directly to the role,
 	// e.g. ["EXECUTE TASK", "EXECUTE ALERT"] -> GRANT EXECUTE TASK ON ACCOUNT TO ROLE <role>.
 	AccountPrivileges []string `yaml:"account_privileges,omitempty"`
@@ -730,10 +739,50 @@ func (rp *RoleProcessor) applySpecialGrants(role Role) error {
 		}
 	}
 
+	// Dynamic tables: handle USAGE on all schemas and future grants
+	for _, dt := range role.Permissions.DynamicTables {
+		nameParts := strings.SplitN(normalizeObjectName(dt.Name), ".", 3)
+		if len(nameParts) < 3 {
+			rp.logger.WarnContext(context.Background(), "Dynamic table permission name must be in format DATABASE.SCHEMA.DYNAMIC_TABLE, DATABASE.SCHEMA.*, DATABASE.*.*", "name", dt.Name)
+			continue
+		}
+		dbName, schemaPattern, tablePattern := nameParts[0], nameParts[1], nameParts[2]
+
+		if schemaPattern == "*" && tablePattern == "*" {
+			if err := grantUsageOnAllSchemas(dbName); err != nil {
+				return err
+			}
+		}
+
+		if tablePattern == "*" {
+			schemas, err := rp.GetSchemasInDatabase(dbName)
+			if err != nil {
+				rp.logger.ErrorContext(context.Background(), "Could not fetch schemas for future grants (dynamic tables)", "database", dbName, "error", err)
+				continue
+			}
+			qDB := quoteIdentifier(dbName)
+			for _, schemaName := range schemas {
+				if !patternMatches(schemaPattern, schemaName) {
+					continue
+				}
+				qSchema := quoteIdentifier(schemaName)
+				objectName := fmt.Sprintf("%s.%s", dbName, schemaName)
+				for _, privilege := range dt.Grants {
+					privilege = strings.ToUpper(privilege)
+					query := fmt.Sprintf("GRANT %s ON FUTURE DYNAMIC TABLES IN SCHEMA %s.%s TO ROLE %s", privilege, qDB, qSchema, rp.qRole)
+					if err := rp.execQuery(query); err != nil {
+						rp.logger.WarnContext(context.Background(), "Failed to grant future privilege on dynamic tables", "schema", objectName, "privilege", privilege, "error", err)
+					}
+				}
+			}
+		}
+	}
+
 	// Explicitly revoke future grants if no wildcard pattern is present in config
-	// Build a set of (db, schema) for which a wildcard future grant is desired for tables/views
+	// Build a set of (db, schema) for which a wildcard future grant is desired for tables/views/dynamic tables
 	dbSchemaFutureTables := make(map[string]struct{})
 	dbSchemaFutureViews := make(map[string]struct{})
+	dbSchemaFutureDynamicTables := make(map[string]struct{})
 	for _, tbl := range role.Permissions.Tables {
 		nameParts := strings.SplitN(tbl.Name, ".", 3)
 		if len(nameParts) == 3 {
@@ -754,6 +803,16 @@ func (rp *RoleProcessor) applySpecialGrants(role Role) error {
 			}
 		}
 	}
+	for _, dt := range role.Permissions.DynamicTables {
+		nameParts := strings.SplitN(normalizeObjectName(dt.Name), ".", 3)
+		if len(nameParts) == 3 {
+			db, schema, table := nameParts[0], nameParts[1], nameParts[2]
+			if table == "*" {
+				key := db + "." + schema
+				dbSchemaFutureDynamicTables[key] = struct{}{}
+			}
+		}
+	}
 
 	// For each database in config, enumerate all schemas and explicitly revoke future grants if not desired
 	current := rp.fetchCurrentGrants()
@@ -770,6 +829,24 @@ func (rp *RoleProcessor) applySpecialGrants(role Role) error {
 		if len(nameParts) == 3 {
 			db := strings.ToUpper(nameParts[0])
 			dbSet[db] = struct{}{}
+		}
+	}
+	for _, dt := range role.Permissions.DynamicTables {
+		nameParts := strings.SplitN(normalizeObjectName(dt.Name), ".", 3)
+		if len(nameParts) == 3 {
+			dbSet[nameParts[0]] = struct{}{}
+		}
+	}
+	// Also include databases that currently hold a FUTURE_TABLE/FUTURE_VIEW/FUTURE_DYNAMIC_TABLE
+	// grant even if the config no longer references that database at all (e.g. the last
+	// table/view/dynamic_table entry for it was removed) — otherwise the stale future grant would
+	// never be enumerated for revoke below.
+	for gk := range current {
+		switch gk.ObjectType {
+		case "FUTURE_TABLE", "FUTURE_VIEW", "FUTURE_DYNAMIC_TABLE":
+			if db, _, ok := strings.Cut(gk.ObjectName, "."); ok {
+				dbSet[db] = struct{}{}
+			}
 		}
 	}
 	for db := range dbSet {
@@ -800,6 +877,18 @@ func (rp *RoleProcessor) applySpecialGrants(role Role) error {
 						err := rp.execQuery(query)
 						if err != nil {
 							rp.logger.WarnContext(context.Background(), "Explicitly revoked future view grant", "query", query, "error", err)
+						}
+					}
+				}
+			}
+			// FUTURE_DYNAMIC_TABLE
+			if _, want := dbSchemaFutureDynamicTables[key]; !want {
+				for gk := range current {
+					if gk.ObjectType == "FUTURE_DYNAMIC_TABLE" && gk.ObjectName == key {
+						query := rp.buildRevokeQuery(gk)
+						err := rp.execQuery(query)
+						if err != nil {
+							rp.logger.WarnContext(context.Background(), "Explicitly revoked future dynamic table grant", "query", query, "error", err)
 						}
 					}
 				}
@@ -1054,6 +1143,52 @@ func (rp *RoleProcessor) GetViewsInDatabase(dbName string) (map[string][]string,
 	return result, nil
 }
 
+// GetDynamicTablesInDatabase fetches all dynamic tables in a given database, grouped by schema.
+func (rp *RoleProcessor) GetDynamicTablesInDatabase(dbName string) (map[string][]string, error) {
+	ctx := context.Background()
+	query := "SHOW DYNAMIC TABLES IN DATABASE " + quoteIdentifier(dbName) //nolint:gosec // G202: dbName is safely quoted by quoteIdentifier
+	rows, err := rp.db.QueryContext(ctx, query)
+	if err != nil {
+		errStr := strings.ToLower(err.Error())
+		if strings.Contains(errStr, "does not exist") || strings.Contains(errStr, "not found") {
+			// Database or schema does not exist, treat as empty
+			return map[string][]string{}, nil
+		}
+		return nil, err
+	}
+	defer rows.Close()
+	cols, _ := rows.Columns()
+	schemaIdx, nameIdx := -1, -1
+	for i, col := range cols {
+		switch strings.ToLower(col) {
+		case "schema_name":
+			schemaIdx = i
+		case "name":
+			nameIdx = i
+		}
+	}
+	if schemaIdx < 0 || nameIdx < 0 {
+		return nil, errors.New("schema_name or name column not found in SHOW DYNAMIC TABLES")
+	}
+	result := make(map[string][]string)
+	for rows.Next() {
+		raw := make([]sql.NullString, len(cols))
+		vals := make([]any, len(cols))
+		for i := range raw {
+			vals[i] = &raw[i]
+		}
+		if err := rows.Scan(vals...); err != nil {
+			return nil, err
+		}
+		schema, table := raw[schemaIdx].String, raw[nameIdx].String
+		result[schema] = append(result[schema], table)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 // ValidateRolesConfig ensures the YAML structure and content validity for roles config.
 func ValidateRolesConfig(rc *RolesConfig) error {
 	if len(rc.Roles) == 0 {
@@ -1278,9 +1413,10 @@ func (rp *RoleProcessor) buildDesiredGrantsFromConfig(role Role) map[GrantKey]st
 		}
 	}
 
-	// --- Caching for tables/views ---
+	// --- Caching for tables/views/dynamic tables ---
 	tablesCache := make(map[string]map[string][]string)
 	viewsCache := make(map[string]map[string][]string)
+	dynamicTablesCache := make(map[string]map[string][]string)
 
 	// Tables (expand wildcards to all real tables)
 	for _, tbl := range role.Permissions.Tables {
@@ -1349,6 +1485,40 @@ func (rp *RoleProcessor) buildDesiredGrantsFromConfig(role Role) map[GrantKey]st
 		}
 	}
 
+	// Dynamic tables (expand wildcards to all real dynamic tables)
+	for _, dt := range role.Permissions.DynamicTables {
+		nameParts := strings.SplitN(normalizeObjectName(dt.Name), ".", 3)
+		if len(nameParts) < 3 {
+			continue
+		}
+		dbName, schemaPattern, tablePattern := nameParts[0], nameParts[1], nameParts[2]
+		var dynamicTablesBySchema map[string][]string
+		var ok bool
+		if dynamicTablesBySchema, ok = dynamicTablesCache[dbName]; !ok {
+			d, err := rp.GetDynamicTablesInDatabase(dbName)
+			if err != nil {
+				continue
+			}
+			dynamicTablesBySchema = d
+			dynamicTablesCache[dbName] = d
+		}
+		for schema, tables := range dynamicTablesBySchema {
+			if !patternMatches(schemaPattern, schema) {
+				continue
+			}
+			for _, table := range tables {
+				if !patternMatches(tablePattern, table) {
+					continue
+				}
+				objectName := normalizeObjectName(fmt.Sprintf("%s.%s.%s", dbName, schema, table))
+				for _, priv := range dt.Grants {
+					gk := GrantKey{Privilege: strings.ToUpper(priv), ObjectType: "DYNAMIC TABLE", ObjectName: objectName}
+					grants[gk] = struct{}{}
+				}
+			}
+		}
+	}
+
 	// Workspaces
 	for _, ws := range role.Permissions.Workspaces {
 		for _, priv := range ws.Grants {
@@ -1390,7 +1560,15 @@ func (rp *RoleProcessor) fetchCurrentGrants() map[GrantKey]struct{} {
 		if strings.EqualFold(g.GrantedOn, "ACCOUNT") {
 			objName = ""
 		}
-		gk := GrantKey{Privilege: strings.ToUpper(g.Privilege), ObjectType: strings.ToUpper(g.GrantedOn), ObjectName: objName}
+		// Snowflake reports multi-word object types with underscores in GRANTED_ON (e.g. the
+		// FUTURE_TABLE/FUTURE_VIEW handling above already relies on this). Dynamic table grants
+		// desired-side use the GRANT-syntax spelling "DYNAMIC TABLE" (with a space), so fold the
+		// underscored form back to that here or every sync would churn re-granting it.
+		grantedOn := strings.ToUpper(g.GrantedOn)
+		if grantedOn == "DYNAMIC_TABLE" {
+			grantedOn = "DYNAMIC TABLE"
+		}
+		gk := GrantKey{Privilege: strings.ToUpper(g.Privilege), ObjectType: grantedOn, ObjectName: objName}
 		result[gk] = struct{}{}
 	}
 	return result
@@ -1427,6 +1605,7 @@ func (rp *RoleProcessor) syncRoleGrants(role Role) {
 		len(role.Permissions.Schemas) == 0 &&
 		len(role.Permissions.Tables) == 0 &&
 		len(role.Permissions.Views) == 0 &&
+		len(role.Permissions.DynamicTables) == 0 &&
 		len(role.Permissions.Workspaces) == 0 &&
 		len(role.Permissions.AccountPrivileges) == 0) {
 		return
@@ -1440,13 +1619,14 @@ func (rp *RoleProcessor) syncRoleGrants(role Role) {
 	// Only revoke grants for object types this tool explicitly manages.
 	// Leave ROLE grants and any other unmanaged types alone.
 	managedObjectTypes := map[string]struct{}{
-		"DATABASE":  {},
-		"SCHEMA":    {},
-		"TABLE":     {},
-		"VIEW":      {},
-		"WAREHOUSE": {},
-		"WORKSPACE": {},
-		"ACCOUNT":   {},
+		"DATABASE":      {},
+		"SCHEMA":        {},
+		"TABLE":         {},
+		"VIEW":          {},
+		"DYNAMIC TABLE": {},
+		"WAREHOUSE":     {},
+		"WORKSPACE":     {},
+		"ACCOUNT":       {},
 	}
 	filteredToRevoke := make(map[GrantKey]struct{})
 	for gk := range toRevoke {
