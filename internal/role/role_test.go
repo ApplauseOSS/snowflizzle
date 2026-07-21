@@ -475,12 +475,64 @@ func TestFetchCurrentGrantsAccountNormalization(t *testing.T) {
 	}
 }
 
+// TestBuildDynamicTableGrantStatements locks the SQL emitted for the two-word "DYNAMIC TABLE"
+// object type, since buildGrantStatement/buildRevokeQuery just splice ObjectType straight into
+// "ON <type> <name>" — a typo or wrong casing here silently breaks the emitted GRANT/REVOKE.
+func TestBuildDynamicTableGrantStatements(t *testing.T) {
+	rp := &RoleProcessor{qRole: quoteIdentifier("TESTROLE")}
+	gk := GrantKey{Privilege: "SELECT", ObjectType: "DYNAMIC TABLE", ObjectName: "DB.SCHEMA.MYDT"}
+
+	if got, want := rp.buildGrantStatement(gk), `GRANT SELECT ON DYNAMIC TABLE "DB"."SCHEMA"."MYDT" TO ROLE "TESTROLE"`; got != want {
+		t.Errorf("buildGrantStatement(DYNAMIC TABLE) = %q; want %q", got, want)
+	}
+	if got, want := rp.buildRevokeQuery(gk), `REVOKE SELECT ON DYNAMIC TABLE "DB"."SCHEMA"."MYDT" FROM ROLE "TESTROLE"`; got != want {
+		t.Errorf("buildRevokeQuery(DYNAMIC TABLE) = %q; want %q", got, want)
+	}
+}
+
+// TestFetchCurrentGrantsDynamicTableNormalization checks that fetchCurrentGrants folds a
+// granted_on of "DYNAMIC_TABLE" back to the two-word "DYNAMIC TABLE" spelling used on the
+// desired side, so the diff is idempotent.
+//
+// NOTE: confirmed against real Snowflake output — SHOW GRANTS TO ROLE reports
+// granted_on=DYNAMIC_TABLE for SELECT on a dynamic table.
+func TestFetchCurrentGrantsDynamicTableNormalization(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("error creating sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	columns := []string{"privilege", "granted_on", "name", "granted_to", "grantee_name"}
+	rows := sqlmock.NewRows(columns).
+		AddRow("SELECT", "DYNAMIC_TABLE", "DB.SCHEMA.MYDT", "ROLE", "X")
+	mock.ExpectQuery(`SHOW GRANTS TO ROLE`).WillReturnRows(rows)
+
+	rp := &RoleProcessor{db: db, logger: logging.GetLogger(), roleName: "X"}
+	current := rp.fetchCurrentGrants()
+
+	dtKey := GrantKey{Privilege: "SELECT", ObjectType: "DYNAMIC TABLE", ObjectName: "DB.SCHEMA.MYDT"}
+	if _, ok := current[dtKey]; !ok {
+		t.Fatalf("dynamic table grant not normalized to ObjectType \"DYNAMIC TABLE\"; current = %v", current)
+	}
+
+	desired := map[GrantKey]struct{}{dtKey: {}}
+	if d := difference(desired, current); len(d) != 0 {
+		t.Errorf("expected no grants to add (idempotent), got %v", d)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unfulfilled expectations: %v", err)
+	}
+}
+
 func TestYAMLParsingAndValidation(t *testing.T) {
 	const validYAML = `
 roles:
   - name: TEST
     members:
       - email: user@example.com
+      - username: svc_user
     permissions:
       databases:
         - name: MYDB
@@ -512,6 +564,10 @@ roles:
 	}
 	if err := ValidateRolesConfig(rc); err != nil {
 		t.Errorf("ValidateRolesConfig failed: %v", err)
+	}
+	wantMembers := []RoleMember{{Email: "user@example.com"}, {Username: "svc_user"}}
+	if got := rc.Roles[0].Members; !reflect.DeepEqual(got, wantMembers) {
+		t.Errorf("Members = %+v; want %+v", got, wantMembers)
 	}
 	perms := rc.Roles[0].Permissions
 	if perms == nil {
